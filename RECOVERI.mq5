@@ -1,15 +1,20 @@
 //+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.10                                                           |
-//|  Добавлено:                                                      |
+//|  v1.20                                                           |
+//|  Добавлено в v1.20:                                              |
+//|    - Виртуальный трейлинг-стоп по каждой позиции                 |
+//|    - Уведомления Alert / Sound / Push на ключевые события        |
+//|    - Сохранение состояния через GlobalVariables                  |
+//|    - Безусловная сетка лимитников (BUY_LIMIT/SELL_LIMIT, N уров.)|
+//|  v1.10:                                                          |
 //|    - Закрытие по стороне (BUY/SELL отдельные корзины)            |
 //|    - Виртуальные TP/SL/безубыток по каждой позиции               |
 //|    - Кнопки на панели: Close All / Pause / Lock Now / etc.       |
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.10"
+#property version   "1.20"
 #property strict
 #property description "Universal MT5 Recovery EA - basket recovery from drawdown"
 
@@ -55,6 +60,13 @@ enum ENUM_BASKET_MODE
    BASKET_PER_SIDE = 1        // 1: Separate BUY and SELL baskets
   };
 
+enum ENUM_GRID_SIDE
+  {
+   GRID_BOTH = 0,             // 0: Both sides (BUY_LIMIT below + SELL_LIMIT above)
+   GRID_BUY  = 1,             // 1: BUY_LIMIT only (below market)
+   GRID_SELL = 2              // 2: SELL_LIMIT only (above market)
+  };
+
 //=== Inputs =========================================================
 input group "=== Общие ==="
 input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;
@@ -80,6 +92,11 @@ input bool               InpUseVirtualSL  = false;
 input int                InpVirtualSLPts  = 1000;
 input bool               InpUseVirtualBE  = false;
 input int                InpVirtualBEPts  = 100;
+
+input group "=== Виртуальный трейлинг-стоп (по каждой позиции) ==="
+input bool               InpUseVirtualTSL  = false;
+input int                InpVirtualTSLStartPts = 200;  // профит для активации трейлинга (пункты)
+input int                InpVirtualTSLDistPts  = 100;  // расстояние трейлинга от пика (пункты)
 
 input group "=== Стратегии (Averaging/Martingale) ==="
 input double             InpStartLot      = 0.01;
@@ -120,6 +137,24 @@ input bool               InpNewsLow       = false;
 input int                InpNewsMinsBefore= 30;
 input int                InpNewsMinsAfter = 30;
 
+input group "=== Уведомления ==="
+input bool               InpUseAlert      = true;       // всплывающий Alert()
+input bool               InpUseSound      = false;      // звук
+input string             InpSoundFile     = "alert.wav";
+input bool               InpUsePush       = false;      // Push на телефон (Settings -> Notifications)
+
+input group "=== Сохранение состояния ==="
+input bool               InpUsePersistence= true;       // сохранять paused/BE/TSL/peaks через GlobalVariables
+
+input group "=== Безусловная сетка (limit-ордера) ==="
+input bool               InpUseUncondGrid     = false;
+input ENUM_GRID_SIDE     InpGridSide          = GRID_BOTH;
+input int                InpGridLevels        = 5;
+input int                InpGridStepPoints    = 200;
+input double             InpGridStartLot      = 0.01;
+input double             InpGridLotMultiplier = 1.0;     // 1.0 = одинаковый лот, >1 = мартингейл-сетка
+input bool               InpGridReplaceFilled = false;   // переоткрывать сработавшие уровни
+
 input group "=== Панель ==="
 input bool               InpShowPanel     = true;
 input color              InpPanelColor    = clrWhite;
@@ -153,6 +188,16 @@ string  g_panelPrefix    = "RECOVERI_";
 string  g_blockReason    = "";
 ulong   g_beTickets[];
 
+// Per-position virtual trailing stop state
+ulong   g_tslTickets[];     // tickets being trailed
+double  g_tslPeaks[];       // peak profit (in points) per ticket
+
+// Grid state
+bool    g_gridPlaced     = false;
+
+// GlobalVariables key prefix (instance-scoped: symbol + magic)
+string  g_gvPrefix       = "";
+
 #define BTN_CLOSE_ALL  "RECOVERI_BTN_CLOSE_ALL"
 #define BTN_CLOSE_BUY  "RECOVERI_BTN_CLOSE_BUY"
 #define BTN_CLOSE_SELL "RECOVERI_BTN_CLOSE_SELL"
@@ -168,8 +213,11 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetMarginMode();
    trade.LogLevel(LOG_LEVEL_ERRORS);
+   g_gvPrefix = StringFormat("RECOVERI_%s_%I64d_", _Symbol, InpMagic);
+   if(InpUsePersistence) LoadState();
    if(InpShowPanel) CreatePanel();
-   PrintFormat("RECOVERI v1.10 Mode=%d Manage=%d SymScope=%d Basket=%d Magic=%I64d",
+   if(InpUseUncondGrid && !g_gridPlaced) { PlaceUnconditionalGrid(); g_gridPlaced = true; }
+   PrintFormat("RECOVERI v1.20 Mode=%d Manage=%d SymScope=%d Basket=%d Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,InpMagic);
    return INIT_SUCCEEDED;
   }
@@ -177,6 +225,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
+   if(InpUsePersistence) SaveState();
    ObjectsDeleteAll(0, g_panelPrefix);
    ChartRedraw(0);
   }
@@ -192,6 +241,12 @@ void OnTick()
      }
    if(InpUseVirtualTP || InpUseVirtualSL || InpUseVirtualBE)
       VirtualSLTPCheck();
+
+   if(InpUseVirtualTSL)
+      VirtualTSLCheck();
+
+   if(InpUseUncondGrid && InpGridReplaceFilled)
+      ReplenishGrid();
 
 
    BasketState bs;
@@ -223,9 +278,9 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    if(sparam == BTN_CLOSE_ALL)       { Print("BTN: Close All");    CloseAllManaged(); }
    else if(sparam == BTN_CLOSE_BUY)  { Print("BTN: Close BUY");    CloseSide(POSITION_TYPE_BUY); }
    else if(sparam == BTN_CLOSE_SELL) { Print("BTN: Close SELL");   CloseSide(POSITION_TYPE_SELL); }
-   else if(sparam == BTN_PAUSE)      { g_paused = !g_paused; PrintFormat("BTN: Pause=%s", g_paused?"ON":"OFF"); }
+   else if(sparam == BTN_PAUSE)      { g_paused = !g_paused; PrintFormat("BTN: Pause=%s", g_paused?"ON":"OFF"); if(InpUsePersistence) SaveState(); }
    else if(sparam == BTN_LOCK)       { Print("BTN: Lock Now");     ForceLockNow(); }
-   else if(sparam == BTN_RESET)      { Print("BTN: Reset Stop");   g_emergencyStop = false; }
+   else if(sparam == BTN_RESET)      { Print("BTN: Reset Stop");   g_emergencyStop = false; if(InpUsePersistence) SaveState(); }
 
    ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
    ChartRedraw(0);
@@ -302,6 +357,7 @@ void ApplyBasketTrailing(const BasketState &bs)
       if(g_peakProfit >= InpBasketTSLStart && bs.profit <= g_peakProfit - InpBasketTSLStep)
         {
          PrintFormat("Basket TSL combined: peak=%.2f cur=%.2f", g_peakProfit, bs.profit);
+         Notify(StringFormat("Basket TSL hit: peak=%.2f cur=%.2f", g_peakProfit, bs.profit));
          CloseAllManaged(); g_peakProfit = 0;
         }
       return;
@@ -315,6 +371,7 @@ void ApplyBasketTrailing(const BasketState &bs)
       if(g_peakBuyProfit >= InpBasketTSLStart && bs.buyProfit <= g_peakBuyProfit - InpBasketTSLStep)
         {
          PrintFormat("Basket TSL BUY: peak=%.2f cur=%.2f", g_peakBuyProfit, bs.buyProfit);
+         Notify(StringFormat("Basket TSL BUY: peak=%.2f cur=%.2f", g_peakBuyProfit, bs.buyProfit));
          CloseSide(POSITION_TYPE_BUY); g_peakBuyProfit = 0;
         }
      }
@@ -324,6 +381,7 @@ void ApplyBasketTrailing(const BasketState &bs)
       if(g_peakSellProfit >= InpBasketTSLStart && bs.sellProfit <= g_peakSellProfit - InpBasketTSLStep)
         {
          PrintFormat("Basket TSL SELL: peak=%.2f cur=%.2f", g_peakSellProfit, bs.sellProfit);
+         Notify(StringFormat("Basket TSL SELL: peak=%.2f cur=%.2f", g_peakSellProfit, bs.sellProfit));
          CloseSide(POSITION_TYPE_SELL); g_peakSellProfit = 0;
         }
      }
@@ -338,6 +396,7 @@ bool CheckBasketTargets(const BasketState &bs)
       if(bs.profit >= tgt)
         {
          PrintFormat("Target combined: %.2f >= %.2f -> close all", bs.profit, tgt);
+         Notify(StringFormat("Target reached: %.2f >= %.2f -> close all", bs.profit, tgt));
          CloseAllManaged(); g_peakProfit = 0;
          return true;
         }
@@ -353,6 +412,7 @@ bool CheckBasketTargets(const BasketState &bs)
       if(bs.buyProfit >= tgt)
         {
          PrintFormat("Target BUY: %.2f >= %.2f", bs.buyProfit, tgt);
+         Notify(StringFormat("Target BUY: %.2f >= %.2f", bs.buyProfit, tgt));
          CloseSide(POSITION_TYPE_BUY); g_peakBuyProfit = 0; any = true;
         }
      }
@@ -362,6 +422,7 @@ bool CheckBasketTargets(const BasketState &bs)
       if(bs.sellProfit >= tgt)
         {
          PrintFormat("Target SELL: %.2f >= %.2f", bs.sellProfit, tgt);
+         Notify(StringFormat("Target SELL: %.2f >= %.2f", bs.sellProfit, tgt));
          CloseSide(POSITION_TYPE_SELL); g_peakSellProfit = 0; any = true;
         }
      }
@@ -465,7 +526,10 @@ void VirtualSLTPCheck()
       if(doClose)
         {
          if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
+           {
             PrintFormat("Virtual %s on #%I64u (%.0f pts)", reason, tickets[i], pts);
+            Notify(StringFormat("Virtual %s on #%I64u (%.0f pts)", reason, tickets[i], pts));
+           }
         }
      }
   }
@@ -482,7 +546,9 @@ bool CheckEmergencyStop()
    if(pct <= InpEquityStopPct)
      {
       PrintFormat("EMERGENCY STOP: eq=%.2f bal=%.2f (%.1f%% <= %.1f%%)", eq, bal, pct, InpEquityStopPct);
+      Notify(StringFormat("EMERGENCY STOP: equity %.2f / balance %.2f (%.1f%%)", eq, bal, pct));
       g_emergencyStop = true;
+      if(InpUsePersistence) SaveState();
       return true;
      }
    return false;
@@ -802,7 +868,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.10 ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.20 ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -841,5 +907,258 @@ void UpdatePanel(const BasketState &bs)
 
    ObjectSetString(0, BTN_PAUSE, OBJPROP_TEXT, g_paused ? "Resume" : "Pause");
    ChartRedraw(0);
+  }
+//+------------------------------------------------------------------+
+
+
+
+//+------------------------------------------------------------------+
+//| Notifications: Alert / Sound / Push                              |
+//+------------------------------------------------------------------+
+void Notify(const string text)
+  {
+   string tag = StringFormat("[RECOVERI %s] %s", _Symbol, text);
+   if(InpUseAlert) Alert(tag);
+   if(InpUseSound && InpSoundFile != "") PlaySound(InpSoundFile);
+   if(InpUsePush)  SendNotification(tag);
+  }
+
+//+------------------------------------------------------------------+
+//| Per-position virtual trailing stop                               |
+//+------------------------------------------------------------------+
+int TslIndexOf(const ulong ticket)
+  {
+   for(int i = 0; i < ArraySize(g_tslTickets); i++)
+      if(g_tslTickets[i] == ticket) return i;
+   return -1;
+  }
+
+void TslSet(const ulong ticket, const double peakPts)
+  {
+   int idx = TslIndexOf(ticket);
+   if(idx < 0)
+     {
+      int n = ArraySize(g_tslTickets);
+      ArrayResize(g_tslTickets, n+1);
+      ArrayResize(g_tslPeaks,   n+1);
+      g_tslTickets[n] = ticket;
+      g_tslPeaks[n]   = peakPts;
+     }
+   else
+      g_tslPeaks[idx] = peakPts;
+  }
+
+void TslRemove(const ulong ticket)
+  {
+   int idx = TslIndexOf(ticket);
+   if(idx < 0) return;
+   int n = ArraySize(g_tslTickets);
+   for(int i = idx; i < n-1; i++)
+     {
+      g_tslTickets[i] = g_tslTickets[i+1];
+      g_tslPeaks[i]   = g_tslPeaks[i+1];
+     }
+   ArrayResize(g_tslTickets, n-1);
+   ArrayResize(g_tslPeaks,   n-1);
+  }
+
+
+
+//+------------------------------------------------------------------+
+void VirtualTSLCheck()
+  {
+   ulong tickets[];
+   int total = PositionsTotal();
+   for(int i=0; i<total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(IsManaged(t))
+        { int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = t; }
+     }
+   for(int i=0; i<ArraySize(tickets); i++)
+     {
+      if(!pos.SelectByTicket(tickets[i])) continue;
+      string s   = pos.Symbol();
+      double pt  = SymbolInfoDouble(s, SYMBOL_POINT);
+      if(pt <= 0) continue;
+      double bid = SymbolInfoDouble(s, SYMBOL_BID);
+      double ask = SymbolInfoDouble(s, SYMBOL_ASK);
+      double op  = pos.PriceOpen();
+      ENUM_POSITION_TYPE pt2 = pos.PositionType();
+      double pts = (pt2 == POSITION_TYPE_BUY) ? (bid - op)/pt : (op - ask)/pt;
+
+      int idx = TslIndexOf(tickets[i]);
+      double peak = (idx >= 0) ? g_tslPeaks[idx] : -DBL_MAX;
+      if(pts >= InpVirtualTSLStartPts && pts > peak)
+        {
+         TslSet(tickets[i], pts);
+         peak = pts;
+        }
+      if(idx >= 0 && peak >= InpVirtualTSLStartPts &&
+         pts <= peak - InpVirtualTSLDistPts)
+        {
+         if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
+           {
+            PrintFormat("Virtual TSL #%I64u: peak=%.0f cur=%.0f pts -> closed", tickets[i], peak, pts);
+            Notify(StringFormat("Virtual TSL #%I64u: peak=%.0f cur=%.0f pts", tickets[i], peak, pts));
+            TslRemove(tickets[i]);
+           }
+        }
+     }
+  }
+
+
+
+//+------------------------------------------------------------------+
+//| Persistence via GlobalVariables                                  |
+//+------------------------------------------------------------------+
+void SaveState()
+  {
+   if(g_gvPrefix == "") return;
+   GlobalVariableSet(g_gvPrefix + "PAUSED",  g_paused        ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "ESTOP",   g_emergencyStop ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "PEAK_C",  g_peakProfit);
+   GlobalVariableSet(g_gvPrefix + "PEAK_B",  g_peakBuyProfit);
+   GlobalVariableSet(g_gvPrefix + "PEAK_S",  g_peakSellProfit);
+   GlobalVariableSet(g_gvPrefix + "GRID",    g_gridPlaced    ? 1.0 : 0.0);
+
+   // Wipe stale BE/TSL globals for tickets no longer present
+   int total = GlobalVariablesTotal();
+   string bePrefix  = "RECOVERI_BE_";
+   string tslPrefix = "RECOVERI_TSL_";
+   for(int i = total-1; i >= 0; i--)
+     {
+      string n = GlobalVariableName(i);
+      if(StringFind(n, bePrefix)  == 0) GlobalVariableDel(n);
+      if(StringFind(n, tslPrefix) == 0) GlobalVariableDel(n);
+     }
+   // Re-write current
+   for(int i=0; i<ArraySize(g_beTickets); i++)
+      GlobalVariableSet(StringFormat("%s%I64u", bePrefix, g_beTickets[i]), 1.0);
+   for(int i=0; i<ArraySize(g_tslTickets); i++)
+      GlobalVariableSet(StringFormat("%s%I64u", tslPrefix, g_tslTickets[i]), g_tslPeaks[i]);
+  }
+
+void LoadState()
+  {
+   if(g_gvPrefix == "") return;
+   if(GlobalVariableCheck(g_gvPrefix + "PAUSED")) g_paused        = (GlobalVariableGet(g_gvPrefix + "PAUSED") > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "ESTOP"))  g_emergencyStop = (GlobalVariableGet(g_gvPrefix + "ESTOP")  > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "PEAK_C")) g_peakProfit     = GlobalVariableGet(g_gvPrefix + "PEAK_C");
+   if(GlobalVariableCheck(g_gvPrefix + "PEAK_B")) g_peakBuyProfit  = GlobalVariableGet(g_gvPrefix + "PEAK_B");
+   if(GlobalVariableCheck(g_gvPrefix + "PEAK_S")) g_peakSellProfit = GlobalVariableGet(g_gvPrefix + "PEAK_S");
+   if(GlobalVariableCheck(g_gvPrefix + "GRID"))   g_gridPlaced     = (GlobalVariableGet(g_gvPrefix + "GRID")  > 0.5);
+
+   ArrayResize(g_beTickets, 0);
+   ArrayResize(g_tslTickets, 0);
+   ArrayResize(g_tslPeaks, 0);
+   int total = GlobalVariablesTotal();
+   for(int i = 0; i < total; i++)
+     {
+      string n = GlobalVariableName(i);
+      ulong  ticket = 0;
+      if(StringFind(n, "RECOVERI_BE_") == 0)
+        { ticket = (ulong)StringToInteger(StringSubstr(n, 12)); if(PositionSelectByTicket(ticket)) VirtualBeMark(ticket); }
+      else if(StringFind(n, "RECOVERI_TSL_") == 0)
+        { ticket = (ulong)StringToInteger(StringSubstr(n, 13)); if(PositionSelectByTicket(ticket)) TslSet(ticket, GlobalVariableGet(n)); }
+     }
+   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d",
+               g_paused, g_emergencyStop, g_peakProfit, g_peakBuyProfit, g_peakSellProfit,
+               ArraySize(g_beTickets), ArraySize(g_tslTickets));
+  }
+
+
+
+//+------------------------------------------------------------------+
+//| Unconditional grid of pending limit orders                       |
+//+------------------------------------------------------------------+
+int CountManagedPending(const ENUM_ORDER_TYPE filterType)
+  {
+   int count = 0;
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong tk = OrderGetTicket(i);
+      if(tk == 0) continue;
+      if(!OrderSelect(tk)) continue;
+      if((string)OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if((long)OrderGetInteger(ORDER_MAGIC)   != InpMagic) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != filterType) continue;
+      count++;
+     }
+   return count;
+  }
+
+double GridLot(const int level)
+  {
+   double lot = InpGridStartLot * MathPow(InpGridLotMultiplier, MathMax(0, level));
+   return NormalizeLot(_Symbol, lot);
+  }
+
+void PlaceUnconditionalGrid()
+  {
+   sym.Name(_Symbol); sym.RefreshRates();
+   double pt   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double bid  = sym.Bid();
+   double ask  = sym.Ask();
+   if(pt <= 0 || bid <= 0 || ask <= 0)
+     { Print("Grid: bad quotes, skip"); return; }
+
+   long stopsPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double stopsDist = (double)stopsPts * pt;
+
+   trade.SetExpertMagicNumber(InpMagic);
+   int placed = 0;
+   for(int i = 1; i <= InpGridLevels; i++)
+     {
+      double off = i * InpGridStepPoints * pt;
+      if(off < stopsDist) off = stopsDist + pt;
+      double lot = GridLot(i-1);
+      string cmt = StringFormat("%s|GRID-%d", InpComment, i);
+      if(InpGridSide == GRID_BOTH || InpGridSide == GRID_BUY)
+         if(trade.BuyLimit(lot, NormalizeDouble(ask - off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-B"))
+            placed++;
+      if(InpGridSide == GRID_BOTH || InpGridSide == GRID_SELL)
+         if(trade.SellLimit(lot, NormalizeDouble(bid + off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-S"))
+            placed++;
+     }
+   PrintFormat("Grid placed: %d orders (levels=%d, step=%d pts, side=%d)",
+               placed, InpGridLevels, InpGridStepPoints, (int)InpGridSide);
+  }
+
+
+
+//+------------------------------------------------------------------+
+//| Replenish triggered grid levels (re-place limits after fill)     |
+//+------------------------------------------------------------------+
+void ReplenishGrid()
+  {
+   if(!InpGridReplaceFilled) return;
+   int wantBuy  = (InpGridSide == GRID_BOTH || InpGridSide == GRID_BUY)  ? InpGridLevels : 0;
+   int wantSell = (InpGridSide == GRID_BOTH || InpGridSide == GRID_SELL) ? InpGridLevels : 0;
+   int haveBuy  = CountManagedPending(ORDER_TYPE_BUY_LIMIT);
+   int haveSell = CountManagedPending(ORDER_TYPE_SELL_LIMIT);
+   if(haveBuy >= wantBuy && haveSell >= wantSell) return;
+
+   sym.Name(_Symbol); sym.RefreshRates();
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double bid = sym.Bid(), ask = sym.Ask();
+   long   stopsPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double stopsDist = (double)stopsPts * pt;
+
+   trade.SetExpertMagicNumber(InpMagic);
+   int needB = wantBuy  - haveBuy;
+   int needS = wantSell - haveSell;
+   for(int i = 1; i <= MathMax(needB, needS); i++)
+     {
+      double off = i * InpGridStepPoints * pt;
+      if(off < stopsDist) off = stopsDist + pt;
+      double lot = GridLot(i-1);
+      string cmt = StringFormat("%s|GRID-R%d", InpComment, i);
+      if(i <= needB)
+         trade.BuyLimit(lot,  NormalizeDouble(ask - off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-B");
+      if(i <= needS)
+         trade.SellLimit(lot, NormalizeDouble(bid + off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-S");
+     }
   }
 //+------------------------------------------------------------------+
