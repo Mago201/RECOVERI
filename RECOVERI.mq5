@@ -1,8 +1,15 @@
 //+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.20                                                           |
-//|  Добавлено в v1.20:                                              |
+//|  v1.30                                                           |
+//|  Добавлено в v1.30:                                              |
+//|    - Авто-распил (раскулачивание) лока в режиме HedgeLock        |
+//|      Фазы: IDLE -> LOCKED -> UNWOUND -> (RELOCKED) -> ...        |
+//|      Закрытие выгодной ноги по цели/трейлингу                    |
+//|      Опциональное переоткрытие частичного встречного лока        |
+//|    - Валидация InpLockTriggerLoss > 0                            |
+//|    - g_gridPlaced ставится только при реальной установке сетки   |
+//|  v1.20:                                                          |
 //|    - Виртуальный трейлинг-стоп по каждой позиции                 |
 //|    - Уведомления Alert / Sound / Push на ключевые события        |
 //|    - Сохранение состояния через GlobalVariables                  |
@@ -14,7 +21,7 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.20"
+#property version   "1.30"
 #property strict
 #property description "Universal MT5 Recovery EA - basket recovery from drawdown"
 
@@ -67,6 +74,14 @@ enum ENUM_GRID_SIDE
    GRID_SELL = 2              // 2: SELL_LIMIT only (above market)
   };
 
+enum ENUM_LOCK_PHASE
+  {
+   PHASE_IDLE     = 0,        // 0: no lock
+   PHASE_LOCKED   = 1,        // 1: both sides open (locked)
+   PHASE_UNWOUND  = 2,        // 2: one side closed, managing remaining side
+   PHASE_RELOCKED = 3         // 3: counter-lock opened on top of remaining side
+  };
+
 //=== Inputs =========================================================
 input group "=== Общие ==="
 input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;
@@ -110,6 +125,18 @@ input double             InpMaxLot        = 1.0;
 input group "=== HedgeLock ==="
 input double             InpLockTriggerLoss= 50.0;
 input double             InpLockLotFactor = 1.0;
+
+
+input group "=== Авто-распил лока (Mode 3) ==="
+input bool               InpAutoUnlock          = false;   // включить авто-распил после лока
+input double             InpUnlockProfitUSD     = 30.0;    // профит ОДНОЙ ноги для её закрытия (в валюте депо)
+input bool               InpUseSideTSL          = true;    // трейлинг профита ноги при распиле
+input double             InpUnlockTSLStart      = 50.0;    // пик профита ноги для активации TSL
+input double             InpUnlockTSLStep       = 20.0;    // откат от пика для закрытия ноги
+input bool               InpEnableRelock        = false;   // переоткрывать частичный встречный лок при провале
+input double             InpRelockTriggerLoss   = 80.0;    // убыток на оставшейся ноге для перелока (в валюте депо)
+input double             InpRelockLotFactor     = 0.5;     // доля объёма оставшейся ноги для перелока (0..1)
+input int                InpMaxRelocks          = 2;       // максимум последовательных перелоков
 
 
 input group "=== Защита счёта ==="
@@ -195,6 +222,13 @@ double  g_tslPeaks[];       // peak profit (in points) per ticket
 // Grid state
 bool    g_gridPlaced     = false;
 
+// Lock-unwind state machine
+ENUM_LOCK_PHASE    g_lockPhase     = PHASE_IDLE;
+ENUM_POSITION_TYPE g_remainingSide = POSITION_TYPE_BUY;  // valid only in PHASE_UNWOUND
+double  g_lockPeakBuy    = 0.0;
+double  g_lockPeakSell   = 0.0;
+int     g_relockCount    = 0;
+
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
 
@@ -208,6 +242,52 @@ string  g_gvPrefix       = "";
 //+------------------------------------------------------------------+
 int OnInit()
   {
+   // --- Input validation ---
+   if(InpMode == MODE_HEDGE_LOCK)
+     {
+      if(InpLockTriggerLoss <= 0)
+        {
+         Print("InpLockTriggerLoss must be > 0 for HedgeLock mode");
+         return INIT_PARAMETERS_INCORRECT;
+        }
+      if(InpLockLotFactor <= 0)
+        {
+         Print("InpLockLotFactor must be > 0");
+         return INIT_PARAMETERS_INCORRECT;
+        }
+      if(InpAutoUnlock)
+        {
+         if(InpUnlockProfitUSD <= 0)
+           {
+            Print("InpUnlockProfitUSD must be > 0 when InpAutoUnlock=true");
+            return INIT_PARAMETERS_INCORRECT;
+           }
+         if(InpUseSideTSL && (InpUnlockTSLStart <= 0 || InpUnlockTSLStep <= 0))
+           {
+            Print("InpUnlockTSLStart and InpUnlockTSLStep must be > 0 when InpUseSideTSL=true");
+            return INIT_PARAMETERS_INCORRECT;
+           }
+         if(InpEnableRelock)
+           {
+            if(InpRelockTriggerLoss <= 0)
+              {
+               Print("InpRelockTriggerLoss must be > 0 when InpEnableRelock=true");
+               return INIT_PARAMETERS_INCORRECT;
+              }
+            if(InpRelockLotFactor <= 0 || InpRelockLotFactor > 1.0)
+              {
+               Print("InpRelockLotFactor must be in (0, 1]");
+               return INIT_PARAMETERS_INCORRECT;
+              }
+            if(InpMaxRelocks < 1)
+              {
+               Print("InpMaxRelocks must be >= 1 when InpEnableRelock=true");
+               return INIT_PARAMETERS_INCORRECT;
+              }
+           }
+        }
+     }
+
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints((ulong)InpSlippage);
    trade.SetTypeFillingBySymbol(_Symbol);
@@ -216,9 +296,10 @@ int OnInit()
    g_gvPrefix = StringFormat("RECOVERI_%s_%I64d_", _Symbol, InpMagic);
    if(InpUsePersistence) LoadState();
    if(InpShowPanel) CreatePanel();
-   if(InpUseUncondGrid && !g_gridPlaced) { PlaceUnconditionalGrid(); g_gridPlaced = true; }
-   PrintFormat("RECOVERI v1.20 Mode=%d Manage=%d SymScope=%d Basket=%d Magic=%I64d",
-               (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,InpMagic);
+   if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
+   PrintFormat("RECOVERI v1.30 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Magic=%I64d",
+               (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
+               (int)InpAutoUnlock, InpMagic);
    return INIT_SUCCEEDED;
   }
 
@@ -710,6 +791,10 @@ void DoHedgeLock(const BasketState &bs)
   {
    if(InpSymbolScope != SCOPE_CURRENT) return;
    if(!SpreadOK(_Symbol)) return;
+
+   // If auto-unwind is enabled, run the state machine instead of plain lock
+   if(InpAutoUnlock) { DoLockUnwind(bs); return; }
+
    if(bs.count >= InpMaxTrades) return;
    if(bs.profit > -InpLockTriggerLoss) return;
    double net = bs.buyVolume - bs.sellVolume;
@@ -719,6 +804,197 @@ void DoHedgeLock(const BasketState &bs)
    if(lot <= 0) return;
    if(net > 0) OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "LOCK");
    else        OpenPosition(_Symbol, ORDER_TYPE_BUY,  lot, "LOCK");
+  }
+
+
+//+------------------------------------------------------------------+
+//| Auto-unwind lock state machine (HedgeLock + InpAutoUnlock=true)  |
+//|   IDLE     -> open lock when loss > InpLockTriggerLoss           |
+//|   LOCKED   -> close profitable side at target/TSL                |
+//|   UNWOUND  -> manage remaining side; optional re-lock on deep DD |
+//|   RELOCKED -> close profitable side -> back to UNWOUND           |
+//+------------------------------------------------------------------+
+void DoLockUnwind(const BasketState &bs)
+  {
+   // Universal reset: nothing on the table -> phase IDLE
+   if(bs.count == 0)
+     {
+      if(g_lockPhase != PHASE_IDLE)
+        {
+         g_lockPhase   = PHASE_IDLE;
+         g_lockPeakBuy = 0; g_lockPeakSell = 0;
+         g_relockCount = 0;
+         if(InpUsePersistence) SaveState();
+        }
+      return;
+     }
+
+   // Auto-detect existing lock (e.g., user enabled feature mid-session)
+   if(g_lockPhase == PHASE_IDLE && bs.buyCount > 0 && bs.sellCount > 0)
+     {
+      g_lockPhase   = PHASE_LOCKED;
+      g_lockPeakBuy = bs.buyProfit  > 0 ? bs.buyProfit  : 0;
+      g_lockPeakSell= bs.sellProfit > 0 ? bs.sellProfit : 0;
+      Notify("Auto-unwind: existing lock detected -> PHASE_LOCKED");
+      if(InpUsePersistence) SaveState();
+     }
+
+   switch(g_lockPhase)
+     {
+      case PHASE_IDLE:
+        {
+         // Open lock when loss exceeds trigger
+         if(bs.count >= InpMaxTrades) return;
+         if(bs.profit > -InpLockTriggerLoss) return;
+         double net = bs.buyVolume - bs.sellVolume;
+         double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+         if(MathAbs(net) < minLot) return;
+         double lot = NormalizeLot(_Symbol, MathAbs(net) * InpLockLotFactor);
+         if(lot <= 0) return;
+         bool ok = (net > 0)
+                   ? OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "LOCK")
+                   : OpenPosition(_Symbol, ORDER_TYPE_BUY,  lot, "LOCK");
+         if(ok)
+           {
+            g_lockPhase    = PHASE_LOCKED;
+            g_lockPeakBuy  = 0;
+            g_lockPeakSell = 0;
+            g_relockCount  = 0;
+            Notify(StringFormat("Auto-unwind: lock opened (lot=%.2f) -> PHASE_LOCKED", lot));
+            if(InpUsePersistence) SaveState();
+           }
+         break;
+        }
+
+      case PHASE_LOCKED:
+      case PHASE_RELOCKED:
+        {
+         // External close happened (basket target / TSL / manual button)
+         if(bs.buyCount == 0 || bs.sellCount == 0)
+           {
+            if(bs.buyCount > 0)
+              { g_remainingSide = POSITION_TYPE_BUY;  g_lockPhase = PHASE_UNWOUND; }
+            else if(bs.sellCount > 0)
+              { g_remainingSide = POSITION_TYPE_SELL; g_lockPhase = PHASE_UNWOUND; }
+            else
+              { g_lockPhase = PHASE_IDLE; g_relockCount = 0; }
+            g_lockPeakBuy = 0; g_lockPeakSell = 0;
+            if(InpUsePersistence) SaveState();
+            return;
+           }
+
+         // Update peaks per side
+         if(bs.buyProfit  > g_lockPeakBuy)  g_lockPeakBuy  = bs.buyProfit;
+         if(bs.sellProfit > g_lockPeakSell) g_lockPeakSell = bs.sellProfit;
+
+         // Direct profit target on either side
+         if(bs.buyProfit >= InpUnlockProfitUSD)
+           {
+            PrintFormat("Auto-unwind: BUY hit unlock profit %.2f >= %.2f", bs.buyProfit, InpUnlockProfitUSD);
+            Notify(StringFormat("Auto-unwind: close BUY at %.2f", bs.buyProfit));
+            CloseSide(POSITION_TYPE_BUY);
+            g_remainingSide = POSITION_TYPE_SELL;
+            g_lockPhase     = PHASE_UNWOUND;
+            g_lockPeakBuy = 0; g_lockPeakSell = 0;
+            if(InpUsePersistence) SaveState();
+            return;
+           }
+         if(bs.sellProfit >= InpUnlockProfitUSD)
+           {
+            PrintFormat("Auto-unwind: SELL hit unlock profit %.2f >= %.2f", bs.sellProfit, InpUnlockProfitUSD);
+            Notify(StringFormat("Auto-unwind: close SELL at %.2f", bs.sellProfit));
+            CloseSide(POSITION_TYPE_SELL);
+            g_remainingSide = POSITION_TYPE_BUY;
+            g_lockPhase     = PHASE_UNWOUND;
+            g_lockPeakBuy = 0; g_lockPeakSell = 0;
+            if(InpUsePersistence) SaveState();
+            return;
+           }
+
+         // Per-side trailing
+         if(InpUseSideTSL)
+           {
+            if(g_lockPeakBuy >= InpUnlockTSLStart &&
+               bs.buyProfit  <= g_lockPeakBuy - InpUnlockTSLStep)
+              {
+               PrintFormat("Auto-unwind TSL BUY: peak=%.2f cur=%.2f", g_lockPeakBuy, bs.buyProfit);
+               Notify(StringFormat("Auto-unwind TSL: close BUY (peak %.2f -> %.2f)", g_lockPeakBuy, bs.buyProfit));
+               CloseSide(POSITION_TYPE_BUY);
+               g_remainingSide = POSITION_TYPE_SELL;
+               g_lockPhase     = PHASE_UNWOUND;
+               g_lockPeakBuy = 0; g_lockPeakSell = 0;
+               if(InpUsePersistence) SaveState();
+               return;
+              }
+            if(g_lockPeakSell >= InpUnlockTSLStart &&
+               bs.sellProfit  <= g_lockPeakSell - InpUnlockTSLStep)
+              {
+               PrintFormat("Auto-unwind TSL SELL: peak=%.2f cur=%.2f", g_lockPeakSell, bs.sellProfit);
+               Notify(StringFormat("Auto-unwind TSL: close SELL (peak %.2f -> %.2f)", g_lockPeakSell, bs.sellProfit));
+               CloseSide(POSITION_TYPE_SELL);
+               g_remainingSide = POSITION_TYPE_BUY;
+               g_lockPhase     = PHASE_UNWOUND;
+               g_lockPeakBuy = 0; g_lockPeakSell = 0;
+               if(InpUsePersistence) SaveState();
+               return;
+              }
+           }
+         break;
+        }
+
+      case PHASE_UNWOUND:
+        {
+         // If user manually opened a counter side -> treat as relock
+         if(bs.buyCount > 0 && bs.sellCount > 0)
+           {
+            g_lockPhase    = PHASE_RELOCKED;
+            g_lockPeakBuy  = 0;
+            g_lockPeakSell = 0;
+            Notify("Auto-unwind: counter side detected -> PHASE_RELOCKED");
+            if(InpUsePersistence) SaveState();
+            return;
+           }
+
+         double remainingProfit = (g_remainingSide == POSITION_TYPE_BUY) ? bs.buyProfit  : bs.sellProfit;
+         double remainingVolume = (g_remainingSide == POSITION_TYPE_BUY) ? bs.buyVolume  : bs.sellVolume;
+         int    remainingCount  = (g_remainingSide == POSITION_TYPE_BUY) ? bs.buyCount   : bs.sellCount;
+
+         // Remaining side closed externally (basket target / TSL / button)
+         if(remainingCount == 0)
+           {
+            g_lockPhase   = PHASE_IDLE;
+            g_relockCount = 0;
+            g_lockPeakBuy = 0; g_lockPeakSell = 0;
+            if(InpUsePersistence) SaveState();
+            return;
+           }
+
+         // Optional re-lock if remaining side dives further
+         if(InpEnableRelock &&
+            g_relockCount < InpMaxRelocks &&
+            remainingProfit <= -InpRelockTriggerLoss)
+           {
+            if(bs.count >= InpMaxTrades) return;
+            double factor = MathMax(0.0, MathMin(1.0, InpRelockLotFactor));
+            double lot = NormalizeLot(_Symbol, remainingVolume * factor);
+            if(lot <= 0) return;
+            ENUM_ORDER_TYPE counter = (g_remainingSide == POSITION_TYPE_BUY)
+                                      ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+            if(OpenPosition(_Symbol, counter, lot, StringFormat("RELOCK-%d", g_relockCount+1)))
+              {
+               g_lockPhase    = PHASE_RELOCKED;
+               g_lockPeakBuy  = 0;
+               g_lockPeakSell = 0;
+               g_relockCount++;
+               PrintFormat("Auto-unwind: RELOCK #%d opened, lot=%.2f", g_relockCount, lot);
+               Notify(StringFormat("Auto-unwind: RELOCK #%d (lot=%.2f) -> PHASE_RELOCKED",
+                                   g_relockCount, lot));
+               if(InpUsePersistence) SaveState();
+              }
+           }
+         break;
+        }
+     }
   }
 
 
@@ -820,7 +1096,7 @@ void CreateButton(const string name, int x, int y, int w, int h,
 void CreatePanel()
   {
    string lines[] = {"title","mode","scope","basket","count","buy","sell","profit",
-                     "peak","target","filter","stop"};
+                     "peak","target","lock","filter","stop"};
    int y = 20;
    for(int i=0; i<ArraySize(lines); i++)
      {
@@ -868,7 +1144,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.20 ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.30 ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -888,6 +1164,29 @@ void UpdatePanel(const BasketState &bs)
      {
       SetLabel("peak",   StringFormat("Peak  : B=%.2f S=%.2f", g_peakBuyProfit, g_peakSellProfit));
       SetLabel("target", StringFormat("Target: B=%.2f S=%.2f", tgtBuy, tgtSell));
+     }
+
+   // Lock-unwind status
+   if(InpMode == MODE_HEDGE_LOCK && InpAutoUnlock)
+     {
+      string phaseName = "";
+      color  phaseClr  = InpPanelColor;
+      switch(g_lockPhase)
+        {
+         case PHASE_IDLE:     phaseName = "IDLE";     phaseClr = clrSilver;    break;
+         case PHASE_LOCKED:   phaseName = "LOCKED";   phaseClr = clrGold;      break;
+         case PHASE_UNWOUND:  phaseName = StringFormat("UNWOUND (%s)",
+                                          g_remainingSide==POSITION_TYPE_BUY?"BUY":"SELL");
+                              phaseClr = clrLightSkyBlue; break;
+         case PHASE_RELOCKED: phaseName = "RELOCKED";  phaseClr = clrOrange;   break;
+        }
+      SetLabel("lock", StringFormat("Unwind: %s peakB=%.2f peakS=%.2f relocks=%d/%d",
+                                    phaseName, g_lockPeakBuy, g_lockPeakSell,
+                                    g_relockCount, InpMaxRelocks), phaseClr);
+     }
+   else
+     {
+      SetLabel("lock", "Unwind: off");
      }
 
 
@@ -1021,6 +1320,11 @@ void SaveState()
    GlobalVariableSet(g_gvPrefix + "PEAK_B",  g_peakBuyProfit);
    GlobalVariableSet(g_gvPrefix + "PEAK_S",  g_peakSellProfit);
    GlobalVariableSet(g_gvPrefix + "GRID",    g_gridPlaced    ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "LK_PH",   (double)g_lockPhase);
+   GlobalVariableSet(g_gvPrefix + "LK_RS",   (g_remainingSide == POSITION_TYPE_BUY) ? 0.0 : 1.0);
+   GlobalVariableSet(g_gvPrefix + "LK_PB",   g_lockPeakBuy);
+   GlobalVariableSet(g_gvPrefix + "LK_PS",   g_lockPeakSell);
+   GlobalVariableSet(g_gvPrefix + "LK_RC",   (double)g_relockCount);
 
    // Wipe stale BE/TSL globals for tickets no longer present
    int total = GlobalVariablesTotal();
@@ -1048,6 +1352,11 @@ void LoadState()
    if(GlobalVariableCheck(g_gvPrefix + "PEAK_B")) g_peakBuyProfit  = GlobalVariableGet(g_gvPrefix + "PEAK_B");
    if(GlobalVariableCheck(g_gvPrefix + "PEAK_S")) g_peakSellProfit = GlobalVariableGet(g_gvPrefix + "PEAK_S");
    if(GlobalVariableCheck(g_gvPrefix + "GRID"))   g_gridPlaced     = (GlobalVariableGet(g_gvPrefix + "GRID")  > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "LK_PH"))  g_lockPhase      = (ENUM_LOCK_PHASE)(int)GlobalVariableGet(g_gvPrefix + "LK_PH");
+   if(GlobalVariableCheck(g_gvPrefix + "LK_RS"))  g_remainingSide  = (GlobalVariableGet(g_gvPrefix + "LK_RS") > 0.5) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+   if(GlobalVariableCheck(g_gvPrefix + "LK_PB"))  g_lockPeakBuy    = GlobalVariableGet(g_gvPrefix + "LK_PB");
+   if(GlobalVariableCheck(g_gvPrefix + "LK_PS"))  g_lockPeakSell   = GlobalVariableGet(g_gvPrefix + "LK_PS");
+   if(GlobalVariableCheck(g_gvPrefix + "LK_RC"))  g_relockCount    = (int)GlobalVariableGet(g_gvPrefix + "LK_RC");
 
    ArrayResize(g_beTickets, 0);
    ArrayResize(g_tslTickets, 0);
@@ -1062,9 +1371,10 @@ void LoadState()
       else if(StringFind(n, "RECOVERI_TSL_") == 0)
         { ticket = (ulong)StringToInteger(StringSubstr(n, 13)); if(PositionSelectByTicket(ticket)) TslSet(ticket, GlobalVariableGet(n)); }
      }
-   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d",
+   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d",
                g_paused, g_emergencyStop, g_peakProfit, g_peakBuyProfit, g_peakSellProfit,
-               ArraySize(g_beTickets), ArraySize(g_tslTickets));
+               ArraySize(g_beTickets), ArraySize(g_tslTickets),
+               (int)g_lockPhase, (int)g_remainingSide, g_relockCount);
   }
 
 
@@ -1102,7 +1412,7 @@ void PlaceUnconditionalGrid()
    double bid  = sym.Bid();
    double ask  = sym.Ask();
    if(pt <= 0 || bid <= 0 || ask <= 0)
-     { Print("Grid: bad quotes, skip"); return; }
+     { Print("Grid: bad quotes, skip"); g_gridPlaced = false; return; }
 
    long stopsPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    double stopsDist = (double)stopsPts * pt;
@@ -1124,6 +1434,8 @@ void PlaceUnconditionalGrid()
      }
    PrintFormat("Grid placed: %d orders (levels=%d, step=%d pts, side=%d)",
                placed, InpGridLevels, InpGridStepPoints, (int)InpGridSide);
+   // Bug #3 fix: only mark grid as placed if at least one order succeeded
+   g_gridPlaced = (placed > 0);
   }
 
 
