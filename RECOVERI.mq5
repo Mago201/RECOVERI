@@ -1,136 +1,165 @@
 //+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
-//|                       Universal MT5 Account Recovery EA         |
-//|                                                                  |
-//|  Назначение:                                                     |
-//|     Универсальный советник для "разруливания" счёта из просадки. |
-//|     Берёт под управление существующие позиции (свои/ручные/все)  |
-//|     и закрывает их корзиной по выбранной стратегии восстановления|
-//|                                                                  |
-//|  Стратегии (RecoveryMode):                                       |
-//|     0 - TargetProfit : просто ждать, пока сумма по корзине       |
-//|                        достигнет TargetProfit, затем закрыть всё |
-//|     1 - Averaging    : усреднение в сторону убытка               |
-//|                        (доливка одинаковыми лотами по сетке)     |
-//|     2 - MartingaleGrid: мартингейл-сетка с множителем            |
-//|     3 - HedgeLock    : локирование (хедж) встречной позицией     |
-//|     4 - SmartClose   : закрывать прибыльные парами с убыточными  |
-//|                        так, чтобы суммарно оставаться в плюсе    |
+//|                       Universal MT5 Account Recovery EA          |
+//|  v1.10                                                           |
+//|  Добавлено:                                                      |
+//|    - Закрытие по стороне (BUY/SELL отдельные корзины)            |
+//|    - Виртуальные TP/SL/безубыток по каждой позиции               |
+//|    - Кнопки на панели: Close All / Pause / Lock Now / etc.       |
+//|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property link      ""
-#property version   "1.00"
+#property version   "1.10"
 #property strict
-#property description "Universal MT5 Recovery EA - вытягивает счёт из минуса корзинными методами"
+#property description "Universal MT5 Recovery EA - basket recovery from drawdown"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 #include <Trade\SymbolInfo.mqh>
 #include <Trade\AccountInfo.mqh>
 
-//--- Перечисления настроек -----------------------------------------
+//=== Enums ==========================================================
 enum ENUM_RECOVERY_MODE
   {
-   MODE_TARGET_PROFIT = 0,    // 0: TargetProfit - закрытие корзины по цели
-   MODE_AVERAGING     = 1,    // 1: Averaging - усреднение
-   MODE_MARTINGALE    = 2,    // 2: MartingaleGrid - мартингейл-сетка
-   MODE_HEDGE_LOCK    = 3,    // 3: HedgeLock - локирование
-   MODE_SMART_CLOSE   = 4     // 4: SmartClose - умное парное закрытие
+   MODE_TARGET_PROFIT = 0,    // 0: TargetProfit
+   MODE_AVERAGING     = 1,    // 1: Averaging
+   MODE_MARTINGALE    = 2,    // 2: Martingale grid
+   MODE_HEDGE_LOCK    = 3,    // 3: HedgeLock
+   MODE_SMART_CLOSE   = 4     // 4: SmartClose
   };
 
 enum ENUM_MANAGE_SCOPE
   {
-   MANAGE_ALL    = 0,         // 0: Все позиции (любой magic)
-   MANAGE_MANUAL = 1,         // 1: Только ручные (magic==0)
-   MANAGE_OWN    = 2          // 2: Только свои (по InpMagic)
+   MANAGE_ALL    = 0,         // 0: All positions
+   MANAGE_MANUAL = 1,         // 1: Manual only (magic==0)
+   MANAGE_OWN    = 2          // 2: Own only (by InpMagic)
   };
 
 enum ENUM_SYMBOL_SCOPE
   {
-   SCOPE_CURRENT = 0,         // 0: Только текущий символ
-   SCOPE_ALL     = 1          // 1: Все символы счёта
+   SCOPE_CURRENT = 0,         // 0: Current symbol
+   SCOPE_ALL     = 1          // 1: All symbols
   };
 
 enum ENUM_TARGET_TYPE
   {
-   TARGET_MONEY   = 0,        // 0: В деньгах счёта
-   TARGET_PERCENT = 1,        // 1: В % от баланса
-   TARGET_PIPS    = 2         // 2: Эквивалент в пунктах (по средневзв. лоту)
+   TARGET_MONEY   = 0,        // 0: Money
+   TARGET_PERCENT = 1,        // 1: Percent of balance
+   TARGET_PIPS    = 2         // 2: Pips equivalent
   };
 
-//--- Входные параметры =============================================
-input group "=== Общие настройки ==="
-input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT; // Режим восстановления
-input ENUM_MANAGE_SCOPE  InpManageScope   = MANAGE_ALL;         // Какие позиции управлять
-input ENUM_SYMBOL_SCOPE  InpSymbolScope   = SCOPE_CURRENT;      // По каким символам
-input long               InpMagic         = 20260520;           // Magic (для своих сделок)
-input string             InpComment       = "RECOVERI";         // Комментарий к сделкам
-input int                InpSlippage      = 30;                 // Проскальзывание (пунктов)
-input double             InpMaxSpreadPts  = 0;                  // Макс. спред (0 = не ограничивать)
 
-input group "=== Цель закрытия корзины ==="
-input ENUM_TARGET_TYPE   InpTargetType    = TARGET_MONEY;       // Тип цели
-input double             InpTargetProfit  = 10.0;               // Цель прибыли (валюта/%/пункты)
-input bool               InpUseBasketTSL  = false;              // Использовать трейлинг корзины
-input double             InpBasketTSLStart= 20.0;               // Старт трейлинга (валюта счёта)
-input double             InpBasketTSLStep = 5.0;                // Шаг трейлинга (валюта счёта)
+enum ENUM_BASKET_MODE
+  {
+   BASKET_COMBINED = 0,       // 0: Combined BUY+SELL basket
+   BASKET_PER_SIDE = 1        // 1: Separate BUY and SELL baskets
+  };
 
-input group "=== Усреднение / Мартингейл / Сетка ==="
-input double             InpStartLot      = 0.01;               // Стартовый лот доливки
-input double             InpLotMultiplier = 1.5;                // Множитель лота (мартингейл)
-input double             InpLotAdd        = 0.0;                // Прибавка к лоту (линейная)
-input int                InpStepPoints    = 300;                // Шаг сетки (в пунктах)
-input double             InpStepMultiplier= 1.2;                // Множитель шага сетки
-input int                InpMaxTrades     = 10;                 // Макс. кол-во доливок
-input double             InpMaxLot        = 1.0;                // Макс. размер одной позиции
+//=== Inputs =========================================================
+input group "=== Общие ==="
+input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;
+input ENUM_MANAGE_SCOPE  InpManageScope   = MANAGE_ALL;
+input ENUM_SYMBOL_SCOPE  InpSymbolScope   = SCOPE_CURRENT;
+input long               InpMagic         = 20260520;
+input string             InpComment       = "RECOVERI";
+input int                InpSlippage      = 30;
+input double             InpMaxSpreadPts  = 0;
 
-input group "=== Локирование (HedgeLock) ==="
-input double             InpLockTriggerLoss= 50.0;              // Убыток для локирования (валюта)
-input double             InpLockLotFactor = 1.0;                // Доля лота лока от суммарного
+input group "=== Корзина и цель ==="
+input ENUM_BASKET_MODE   InpBasketMode    = BASKET_COMBINED;
+input ENUM_TARGET_TYPE   InpTargetType    = TARGET_MONEY;
+input double             InpTargetProfit  = 10.0;
+input bool               InpUseBasketTSL  = false;
+input double             InpBasketTSLStart= 20.0;
+input double             InpBasketTSLStep = 5.0;
+
+input group "=== Виртуальные TP/SL ==="
+input bool               InpUseVirtualTP  = false;
+input int                InpVirtualTPPts  = 200;
+input bool               InpUseVirtualSL  = false;
+input int                InpVirtualSLPts  = 1000;
+input bool               InpUseVirtualBE  = false;
+input int                InpVirtualBEPts  = 100;
+
+input group "=== Стратегии (Averaging/Martingale) ==="
+input double             InpStartLot      = 0.01;
+input double             InpLotMultiplier = 1.5;
+input double             InpLotAdd        = 0.0;
+input int                InpStepPoints    = 300;
+input double             InpStepMultiplier= 1.2;
+input int                InpMaxTrades     = 10;
+input double             InpMaxLot        = 1.0;
+
+input group "=== HedgeLock ==="
+input double             InpLockTriggerLoss= 50.0;
+input double             InpLockLotFactor = 1.0;
+
 
 input group "=== Защита счёта ==="
-input bool               InpUseEquityStop = false;              // Аварийный стоп по equity
-input double             InpEquityStopPct = 50.0;               // Стоп при equity ниже % от баланса
-input bool               InpCloseOnly     = false;              // Только закрытие (без новых ордеров)
+input bool               InpUseEquityStop = false;
+input double             InpEquityStopPct = 50.0;
+input bool               InpCloseOnly     = false;
 
-input group "=== Информационная панель ==="
-input bool               InpShowPanel     = true;               // Показывать панель
-input color              InpPanelColor    = clrWhite;           // Цвет текста панели
-input int                InpPanelFontSize = 10;                 // Размер шрифта
+input group "=== Фильтр времени ==="
+input bool               InpUseTimeFilter = false;
+input int                InpStartHour     = 0;
+input int                InpEndHour       = 24;
+input bool               InpTradeMon      = true;
+input bool               InpTradeTue      = true;
+input bool               InpTradeWed      = true;
+input bool               InpTradeThu      = true;
+input bool               InpTradeFri      = true;
+input bool               InpTradeSat      = false;
+input bool               InpTradeSun      = false;
 
-//--- Глобальные объекты --------------------------------------------
+input group "=== Новостной фильтр (MT5 Calendar) ==="
+input bool               InpUseNewsFilter = false;
+input bool               InpNewsHigh      = true;
+input bool               InpNewsMedium    = false;
+input bool               InpNewsLow       = false;
+input int                InpNewsMinsBefore= 30;
+input int                InpNewsMinsAfter = 30;
+
+input group "=== Панель ==="
+input bool               InpShowPanel     = true;
+input color              InpPanelColor    = clrWhite;
+input int                InpPanelFontSize = 10;
+
+//=== Globals ========================================================
 CTrade         trade;
 CPositionInfo  pos;
 CSymbolInfo    sym;
 CAccountInfo   acc;
 
-//--- Кэш состояния -------------------------------------------------
 struct BasketState
   {
-   int      count;          // кол-во позиций
-   double   buyVolume;      // суммарный объем BUY
-   double   sellVolume;     // суммарный объем SELL
-   double   buyPriceAvg;    // средневзвешенная цена BUY
-   double   sellPriceAvg;   // средневзвешенная цена SELL
-   double   profit;         // суммарный плавающий P/L
-   double   maxLossLot;     // макс лот среди убыточных
-   ulong    worstBuyTicket; // тикет худшего BUY
-   ulong    worstSellTicket;// тикет худшего SELL
-   datetime lastOpenTime;   // время последней позиции в корзине
-   double   lastOpenPriceB; // цена последней BUY
-   double   lastOpenPriceS; // цена последней SELL
-   double   lastOpenLotB;   // лот последней BUY
-   double   lastOpenLotS;   // лот последней SELL
-   int      buyCount;
-   int      sellCount;
+   int      count, buyCount, sellCount;
+   double   buyVolume, sellVolume;
+   double   buyPriceAvg, sellPriceAvg;
+   double   profit, buyProfit, sellProfit;
+   ulong    worstBuyTicket, worstSellTicket;
+   datetime lastOpenTime;
+   double   lastOpenPriceB, lastOpenPriceS;
+   double   lastOpenLotB,   lastOpenLotS;
   };
 
-double  g_basketPeakProfit = 0.0;  // пик прибыли для трейлинга корзины
-bool    g_emergencyStop    = false;
-string  g_panelPrefix      = "RECOVERI_PANEL_";
 
-//+------------------------------------------------------------------+
-//| Initialization                                                   |
+double  g_peakProfit     = 0.0;
+double  g_peakBuyProfit  = 0.0;
+double  g_peakSellProfit = 0.0;
+bool    g_emergencyStop  = false;
+bool    g_paused         = false;
+string  g_panelPrefix    = "RECOVERI_";
+string  g_blockReason    = "";
+ulong   g_beTickets[];
+
+#define BTN_CLOSE_ALL  "RECOVERI_BTN_CLOSE_ALL"
+#define BTN_CLOSE_BUY  "RECOVERI_BTN_CLOSE_BUY"
+#define BTN_CLOSE_SELL "RECOVERI_BTN_CLOSE_SELL"
+#define BTN_PAUSE      "RECOVERI_BTN_PAUSE"
+#define BTN_LOCK       "RECOVERI_BTN_LOCK"
+#define BTN_RESET      "RECOVERI_BTN_RESET"
+
 //+------------------------------------------------------------------+
 int OnInit()
   {
@@ -139,17 +168,12 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetMarginMode();
    trade.LogLevel(LOG_LEVEL_ERRORS);
-
-   if(InpShowPanel)
-      CreatePanel();
-
-   PrintFormat("RECOVERI started. Mode=%d, Scope=%d, SymbolScope=%d, Magic=%I64d",
-               (int)InpMode, (int)InpManageScope, (int)InpSymbolScope, InpMagic);
+   if(InpShowPanel) CreatePanel();
+   PrintFormat("RECOVERI v1.10 Mode=%d Manage=%d SymScope=%d Basket=%d Magic=%I64d",
+               (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,InpMagic);
    return INIT_SUCCEEDED;
   }
 
-//+------------------------------------------------------------------+
-//| Deinit                                                           |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
@@ -158,222 +182,306 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
-//| Main tick                                                        |
-//+------------------------------------------------------------------+
 void OnTick()
   {
-   // 1. Аварийный стоп по equity
    if(CheckEmergencyStop())
      {
       CloseAllManaged();
+      BasketState bs0; BuildBasket(bs0); UpdatePanel(bs0);
       return;
      }
+   if(InpUseVirtualTP || InpUseVirtualSL || InpUseVirtualBE)
+      VirtualSLTPCheck();
 
-   // 2. Сбор состояния корзины
+
    BasketState bs;
    BuildBasket(bs);
+   ApplyBasketTrailing(bs);
 
-   // 3. Трейлинг корзины
-   if(InpUseBasketTSL && bs.count > 0)
-     {
-      if(bs.profit > g_basketPeakProfit)
-         g_basketPeakProfit = bs.profit;
+   if(bs.count > 0 && CheckBasketTargets(bs))
+      BuildBasket(bs);
 
-      if(g_basketPeakProfit >= InpBasketTSLStart &&
-         bs.profit <= g_basketPeakProfit - InpBasketTSLStep)
-        {
-         PrintFormat("Basket TSL hit: peak=%.2f cur=%.2f -> close all", g_basketPeakProfit, bs.profit);
-         CloseAllManaged();
-         g_basketPeakProfit = 0.0;
-         UpdatePanel(bs);
-         return;
-        }
-     }
-   if(bs.count == 0)
-      g_basketPeakProfit = 0.0;
-
-   // 4. Проверка цели закрытия
-   if(bs.count > 0 && IsTargetReached(bs))
-     {
-      PrintFormat("Target reached: profit=%.2f -> close all", bs.profit);
-      CloseAllManaged();
-      g_basketPeakProfit = 0.0;
-      UpdatePanel(bs);
-      return;
-     }
-
-   // 5. Стратегии восстановления (только если разрешено открывать)
-   if(!InpCloseOnly && bs.count > 0)
+   if(!InpCloseOnly && bs.count > 0 && IsTradingAllowed())
      {
       switch(InpMode)
         {
-         case MODE_TARGET_PROFIT:                  break; // ждём цель
          case MODE_AVERAGING:    DoAveraging(bs);  break;
          case MODE_MARTINGALE:   DoMartingale(bs); break;
          case MODE_HEDGE_LOCK:   DoHedgeLock(bs);  break;
          case MODE_SMART_CLOSE:  DoSmartClose(bs); break;
+         case MODE_TARGET_PROFIT: break;
         }
      }
-
    UpdatePanel(bs);
   }
 
 //+------------------------------------------------------------------+
-//| Подходит ли позиция под управление                              |
-//+------------------------------------------------------------------+
-bool IsManaged(const ulong ticket)
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
   {
-   if(!pos.SelectByTicket(ticket))
-      return false;
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
 
-   // Фильтр по символу
-   if(InpSymbolScope == SCOPE_CURRENT && pos.Symbol() != _Symbol)
-      return false;
+   if(sparam == BTN_CLOSE_ALL)       { Print("BTN: Close All");    CloseAllManaged(); }
+   else if(sparam == BTN_CLOSE_BUY)  { Print("BTN: Close BUY");    CloseSide(POSITION_TYPE_BUY); }
+   else if(sparam == BTN_CLOSE_SELL) { Print("BTN: Close SELL");   CloseSide(POSITION_TYPE_SELL); }
+   else if(sparam == BTN_PAUSE)      { g_paused = !g_paused; PrintFormat("BTN: Pause=%s", g_paused?"ON":"OFF"); }
+   else if(sparam == BTN_LOCK)       { Print("BTN: Lock Now");     ForceLockNow(); }
+   else if(sparam == BTN_RESET)      { Print("BTN: Reset Stop");   g_emergencyStop = false; }
 
-   // Фильтр по magic
-   long m = pos.Magic();
-   switch(InpManageScope)
-     {
-      case MANAGE_MANUAL: if(m != 0)        return false; break;
-      case MANAGE_OWN:    if(m != InpMagic) return false; break;
-      case MANAGE_ALL:    /* любые */                     break;
-     }
-   return true;
+   ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
+   ChartRedraw(0);
   }
 
 //+------------------------------------------------------------------+
-//| Сбор состояния корзины                                           |
+bool IsManaged(const ulong ticket)
+  {
+   if(!pos.SelectByTicket(ticket)) return false;
+   if(InpSymbolScope == SCOPE_CURRENT && pos.Symbol() != _Symbol) return false;
+   long m = pos.Magic();
+   if(InpManageScope == MANAGE_MANUAL && m != 0)        return false;
+   if(InpManageScope == MANAGE_OWN    && m != InpMagic) return false;
+   return true;
+  }
+
+
 //+------------------------------------------------------------------+
 void BuildBasket(BasketState &bs)
   {
    ZeroMemory(bs);
-   double buySumPV  = 0.0; // sum(price*lot) для BUY
-   double sellSumPV = 0.0;
-   double worstBuyP = 0.0;
-   double worstSellP= 0.0;
-
+   double buyPV=0, sellPV=0, worstB=0, worstS=0;
    int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
+   for(int i=0; i<total; i++)
      {
-      ulong ticket = PositionGetTicket(i);
-      if(!IsManaged(ticket))
-         continue;
-
-      double vol   = pos.Volume();
-      double price = pos.PriceOpen();
-      double pft   = pos.Profit() + pos.Swap() + pos.Commission();
-      datetime t   = (datetime)pos.Time();
-
-      bs.count++;
-      bs.profit += pft;
-      if(t > bs.lastOpenTime) bs.lastOpenTime = t;
-
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      double vol = pos.Volume();
+      double prc = pos.PriceOpen();
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      datetime tm= (datetime)pos.Time();
+      bs.count++; bs.profit += pft;
+      if(tm > bs.lastOpenTime) bs.lastOpenTime = tm;
       if(pos.PositionType() == POSITION_TYPE_BUY)
         {
-         bs.buyCount++;
-         bs.buyVolume += vol;
-         buySumPV     += price * vol;
-         if(price > bs.lastOpenPriceB || bs.lastOpenLotB == 0.0)
-           {
-            bs.lastOpenPriceB = price;
-            bs.lastOpenLotB   = vol;
-           }
-         if(pft < worstBuyP)
-           {
-            worstBuyP = pft;
-            bs.worstBuyTicket = ticket;
-           }
+         bs.buyCount++; bs.buyVolume += vol; bs.buyProfit += pft; buyPV += prc*vol;
+         if(prc > bs.lastOpenPriceB || bs.lastOpenLotB == 0)
+           { bs.lastOpenPriceB = prc; bs.lastOpenLotB = vol; }
+         if(pft < worstB) { worstB = pft; bs.worstBuyTicket = t; }
         }
       else if(pos.PositionType() == POSITION_TYPE_SELL)
         {
-         bs.sellCount++;
-         bs.sellVolume += vol;
-         sellSumPV     += price * vol;
-         if(price < bs.lastOpenPriceS || bs.lastOpenLotS == 0.0)
-           {
-            bs.lastOpenPriceS = price;
-            bs.lastOpenLotS   = vol;
-           }
-         if(pft < worstSellP)
-           {
-            worstSellP = pft;
-            bs.worstSellTicket = ticket;
-           }
+         bs.sellCount++; bs.sellVolume += vol; bs.sellProfit += pft; sellPV += prc*vol;
+         if(prc < bs.lastOpenPriceS || bs.lastOpenLotS == 0)
+           { bs.lastOpenPriceS = prc; bs.lastOpenLotS = vol; }
+         if(pft < worstS) { worstS = pft; bs.worstSellTicket = t; }
         }
      }
-
-   if(bs.buyVolume  > 0) bs.buyPriceAvg  = buySumPV  / bs.buyVolume;
-   if(bs.sellVolume > 0) bs.sellPriceAvg = sellSumPV / bs.sellVolume;
+   if(bs.buyVolume  > 0) bs.buyPriceAvg  = buyPV  / bs.buyVolume;
+   if(bs.sellVolume > 0) bs.sellPriceAvg = sellPV / bs.sellVolume;
   }
 
 //+------------------------------------------------------------------+
-//| Цель закрытия корзины достигнута?                                |
-//+------------------------------------------------------------------+
-bool IsTargetReached(const BasketState &bs)
+double ResolveTargetMoney(double netLot)
   {
-   double target = InpTargetProfit;
+   if(InpTargetType == TARGET_MONEY)   return InpTargetProfit;
+   if(InpTargetType == TARGET_PERCENT) return AccountInfoDouble(ACCOUNT_BALANCE)*InpTargetProfit/100.0;
+   double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double vp = (ts > 0) ? tv*(pt/ts) : 0.0;
+   return InpTargetProfit * vp * MathMax(netLot, 0.01);
+  }
 
-   if(InpTargetType == TARGET_PERCENT)
+
+//+------------------------------------------------------------------+
+void ApplyBasketTrailing(const BasketState &bs)
+  {
+   if(!InpUseBasketTSL) return;
+   if(InpBasketMode == BASKET_COMBINED)
      {
-      target = AccountInfoDouble(ACCOUNT_BALANCE) * InpTargetProfit / 100.0;
+      if(bs.count == 0) { g_peakProfit = 0; return; }
+      if(bs.profit > g_peakProfit) g_peakProfit = bs.profit;
+      if(g_peakProfit >= InpBasketTSLStart && bs.profit <= g_peakProfit - InpBasketTSLStep)
+        {
+         PrintFormat("Basket TSL combined: peak=%.2f cur=%.2f", g_peakProfit, bs.profit);
+         CloseAllManaged(); g_peakProfit = 0;
+        }
+      return;
      }
-   else if(InpTargetType == TARGET_PIPS)
+   // PER_SIDE
+   if(bs.buyCount  == 0) g_peakBuyProfit  = 0;
+   if(bs.sellCount == 0) g_peakSellProfit = 0;
+   if(bs.buyCount > 0)
      {
-      // эквивалент пунктов через стоимость пункта на текущем символе
-      sym.Name(_Symbol);
-      sym.RefreshRates();
-      double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tickSz  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-      double point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      double valPerPoint = (tickSz > 0) ? tickVal * (point / tickSz) : 0.0;
-      double netLot = MathMax(bs.buyVolume + bs.sellVolume, 0.01);
-      target = InpTargetProfit * valPerPoint * netLot;
+      if(bs.buyProfit > g_peakBuyProfit) g_peakBuyProfit = bs.buyProfit;
+      if(g_peakBuyProfit >= InpBasketTSLStart && bs.buyProfit <= g_peakBuyProfit - InpBasketTSLStep)
+        {
+         PrintFormat("Basket TSL BUY: peak=%.2f cur=%.2f", g_peakBuyProfit, bs.buyProfit);
+         CloseSide(POSITION_TYPE_BUY); g_peakBuyProfit = 0;
+        }
      }
-   return (bs.profit >= target);
+   if(bs.sellCount > 0)
+     {
+      if(bs.sellProfit > g_peakSellProfit) g_peakSellProfit = bs.sellProfit;
+      if(g_peakSellProfit >= InpBasketTSLStart && bs.sellProfit <= g_peakSellProfit - InpBasketTSLStep)
+        {
+         PrintFormat("Basket TSL SELL: peak=%.2f cur=%.2f", g_peakSellProfit, bs.sellProfit);
+         CloseSide(POSITION_TYPE_SELL); g_peakSellProfit = 0;
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
-//| Закрыть все управляемые позиции                                  |
+bool CheckBasketTargets(const BasketState &bs)
+  {
+   if(InpBasketMode == BASKET_COMBINED)
+     {
+      double tgt = ResolveTargetMoney(bs.buyVolume + bs.sellVolume);
+      if(bs.profit >= tgt)
+        {
+         PrintFormat("Target combined: %.2f >= %.2f -> close all", bs.profit, tgt);
+         CloseAllManaged(); g_peakProfit = 0;
+         return true;
+        }
+      return false;
+     }
+
+
+   // PER_SIDE
+   bool any = false;
+   if(bs.buyCount > 0)
+     {
+      double tgt = ResolveTargetMoney(bs.buyVolume);
+      if(bs.buyProfit >= tgt)
+        {
+         PrintFormat("Target BUY: %.2f >= %.2f", bs.buyProfit, tgt);
+         CloseSide(POSITION_TYPE_BUY); g_peakBuyProfit = 0; any = true;
+        }
+     }
+   if(bs.sellCount > 0)
+     {
+      double tgt = ResolveTargetMoney(bs.sellVolume);
+      if(bs.sellProfit >= tgt)
+        {
+         PrintFormat("Target SELL: %.2f >= %.2f", bs.sellProfit, tgt);
+         CloseSide(POSITION_TYPE_SELL); g_peakSellProfit = 0; any = true;
+        }
+     }
+   return any;
+  }
+
 //+------------------------------------------------------------------+
 void CloseAllManaged()
   {
-   // Закрываем по тикетам — список собираем заранее, т.к. PositionsTotal меняется
    ulong tickets[];
    int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
+   for(int i=0; i<total; i++)
      {
       ulong t = PositionGetTicket(i);
       if(IsManaged(t))
-        {
-         int n = ArraySize(tickets);
-         ArrayResize(tickets, n + 1);
-         tickets[n] = t;
-        }
+        { int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = t; }
      }
-   for(int i = 0; i < ArraySize(tickets); i++)
-     {
+   for(int i=0; i<ArraySize(tickets); i++)
       if(!trade.PositionClose(tickets[i], (ulong)InpSlippage))
-         PrintFormat("PositionClose failed for #%I64u err=%d", tickets[i], trade.ResultRetcode());
+         PrintFormat("Close #%I64u err=%d", tickets[i], trade.ResultRetcode());
+  }
+
+//+------------------------------------------------------------------+
+void CloseSide(const ENUM_POSITION_TYPE side)
+  {
+   ulong tickets[];
+   int total = PositionsTotal();
+   for(int i=0; i<total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != side) continue;
+      int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = t;
+     }
+   for(int i=0; i<ArraySize(tickets); i++)
+      if(!trade.PositionClose(tickets[i], (ulong)InpSlippage))
+         PrintFormat("CloseSide #%I64u err=%d", tickets[i], trade.ResultRetcode());
+  }
+
+
+//+------------------------------------------------------------------+
+void ForceLockNow()
+  {
+   if(InpSymbolScope != SCOPE_CURRENT)
+     { Print("ForceLockNow: requires SCOPE_CURRENT"); return; }
+   BasketState bs; BuildBasket(bs);
+   double net = bs.buyVolume - bs.sellVolume;
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(MathAbs(net) < minLot) { Print("ForceLockNow: balanced"); return; }
+   double lot = NormalizeLot(_Symbol, MathAbs(net));
+   if(lot <= 0) return;
+   if(net > 0) OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "MANUAL-LOCK");
+   else        OpenPosition(_Symbol, ORDER_TYPE_BUY,  lot, "MANUAL-LOCK");
+  }
+
+//+------------------------------------------------------------------+
+bool VirtualBeTriggered(const ulong ticket)
+  {
+   for(int i=0; i<ArraySize(g_beTickets); i++)
+      if(g_beTickets[i] == ticket) return true;
+   return false;
+  }
+
+void VirtualBeMark(const ulong ticket)
+  {
+   if(VirtualBeTriggered(ticket)) return;
+   int n = ArraySize(g_beTickets); ArrayResize(g_beTickets, n+1); g_beTickets[n] = ticket;
+  }
+
+//+------------------------------------------------------------------+
+void VirtualSLTPCheck()
+  {
+   ulong tickets[];
+   int total = PositionsTotal();
+   for(int i=0; i<total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(IsManaged(t))
+        { int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = t; }
+     }
+   for(int i=0; i<ArraySize(tickets); i++)
+     {
+      if(!pos.SelectByTicket(tickets[i])) continue;
+      string s = pos.Symbol();
+      double pt = SymbolInfoDouble(s, SYMBOL_POINT);
+      if(pt <= 0) continue;
+      double bid = SymbolInfoDouble(s, SYMBOL_BID);
+      double ask = SymbolInfoDouble(s, SYMBOL_ASK);
+      double op  = pos.PriceOpen();
+      ENUM_POSITION_TYPE pt2 = pos.PositionType();
+      double pts = (pt2 == POSITION_TYPE_BUY) ? (bid - op)/pt : (op - ask)/pt;
+
+
+      bool doClose = false; string reason = "";
+      if(InpUseVirtualTP && pts >= InpVirtualTPPts)             { doClose = true; reason = "vTP"; }
+      else if(InpUseVirtualSL && pts <= -InpVirtualSLPts)       { doClose = true; reason = "vSL"; }
+      else if(InpUseVirtualBE && VirtualBeTriggered(tickets[i]) && pts <= 0)
+                                                                { doClose = true; reason = "vBE"; }
+      if(InpUseVirtualBE && pts >= InpVirtualBEPts)
+         VirtualBeMark(tickets[i]);
+      if(doClose)
+        {
+         if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
+            PrintFormat("Virtual %s on #%I64u (%.0f pts)", reason, tickets[i], pts);
+        }
      }
   }
 
 //+------------------------------------------------------------------+
-//| Эмоциональный стоп по equity                                     |
-//+------------------------------------------------------------------+
 bool CheckEmergencyStop()
   {
+   if(g_emergencyStop) return true;
    if(!InpUseEquityStop) return false;
-   if(g_emergencyStop)   return true;
-
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double eq  = AccountInfoDouble(ACCOUNT_EQUITY);
    if(bal <= 0) return false;
-
    double pct = eq / bal * 100.0;
    if(pct <= InpEquityStopPct)
      {
-      PrintFormat("EMERGENCY STOP: equity=%.2f balance=%.2f (%.1f%% <= %.1f%%)",
-                  eq, bal, pct, InpEquityStopPct);
+      PrintFormat("EMERGENCY STOP: eq=%.2f bal=%.2f (%.1f%% <= %.1f%%)", eq, bal, pct, InpEquityStopPct);
       g_emergencyStop = true;
       return true;
      }
@@ -381,18 +489,77 @@ bool CheckEmergencyStop()
   }
 
 //+------------------------------------------------------------------+
-//| Спред в порядке?                                                 |
+bool IsTradingAllowed()
+  {
+   g_blockReason = "";
+   if(g_paused)         { g_blockReason = "PAUSE"; return false; }
+   if(!IsTimeAllowed()) { g_blockReason = "TIME";  return false; }
+   if(IsNewsBlocked())  { g_blockReason = "NEWS";  return false; }
+   return true;
+  }
+
+bool IsTimeAllowed()
+  {
+   if(!InpUseTimeFilter) return true;
+   MqlDateTime t; TimeToStruct(TimeCurrent(), t);
+   bool dayOk = false;
+
+
+   switch(t.day_of_week)
+     {
+      case 0: dayOk = InpTradeSun; break;
+      case 1: dayOk = InpTradeMon; break;
+      case 2: dayOk = InpTradeTue; break;
+      case 3: dayOk = InpTradeWed; break;
+      case 4: dayOk = InpTradeThu; break;
+      case 5: dayOk = InpTradeFri; break;
+      case 6: dayOk = InpTradeSat; break;
+     }
+   if(!dayOk) return false;
+   int sh = MathMax(0, MathMin(24, InpStartHour));
+   int eh = MathMax(0, MathMin(24, InpEndHour));
+   if(sh == eh) return true;
+   if(sh < eh)  return (t.hour >= sh && t.hour < eh);
+   return (t.hour >= sh || t.hour < eh);
+  }
+
+bool IsNewsBlocked()
+  {
+   if(!InpUseNewsFilter) return false;
+   datetime now = TimeCurrent();
+   datetime from = now - InpNewsMinsBefore * 60;
+   datetime to   = now + InpNewsMinsAfter  * 60;
+   string list[2];
+   list[0] = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_BASE);
+   list[1] = SymbolInfoString(_Symbol, SYMBOL_CURRENCY_PROFIT);
+   for(int i=0; i<2; i++)
+     {
+      if(list[i] == "") continue;
+      MqlCalendarValue values[];
+      int n = CalendarValueHistoryByCurrency(list[i], values, from, to);
+      for(int k=0; k<n; k++)
+        {
+         MqlCalendarEvent ev;
+         if(!CalendarEventById(values[k].event_id, ev)) continue;
+         bool match = false;
+         if(ev.importance == CALENDAR_IMPORTANCE_HIGH     && InpNewsHigh)   match = true;
+         if(ev.importance == CALENDAR_IMPORTANCE_MODERATE && InpNewsMedium) match = true;
+         if(ev.importance == CALENDAR_IMPORTANCE_LOW      && InpNewsLow)    match = true;
+         if(match) return true;
+        }
+     }
+   return false;
+  }
+
+
 //+------------------------------------------------------------------+
 bool SpreadOK(const string symbol)
   {
    if(InpMaxSpreadPts <= 0) return true;
-   long spread = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
-   return (spread <= InpMaxSpreadPts);
+   long sp = SymbolInfoInteger(symbol, SYMBOL_SPREAD);
+   return (sp <= InpMaxSpreadPts);
   }
 
-//+------------------------------------------------------------------+
-//| Нормализовать лот к ограничениям символа                         |
-//+------------------------------------------------------------------+
 double NormalizeLot(const string symbol, double lot)
   {
    double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
@@ -400,267 +567,279 @@ double NormalizeLot(const string symbol, double lot)
    double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
    if(step <= 0) step = 0.01;
    lot = MathMax(minLot, MathMin(maxLot, lot));
-   lot = MathFloor(lot / step + 0.0000001) * step;
+   lot = MathFloor(lot/step + 1e-7) * step;
    if(InpMaxLot > 0) lot = MathMin(lot, InpMaxLot);
    return NormalizeDouble(lot, 2);
   }
 
-//+------------------------------------------------------------------+
-//| Текущий шаг сетки в пунктах с учётом множителя                   |
-//+------------------------------------------------------------------+
-int CurrentStepPoints(const int tradesInDirection)
+int CurrentStepPoints(const int n)
   {
-   double s = (double)InpStepPoints * MathPow(InpStepMultiplier, MathMax(0, tradesInDirection - 1));
+   double s = (double)InpStepPoints * MathPow(InpStepMultiplier, MathMax(0, n-1));
    return (int)MathMax(1.0, s);
   }
 
 //+------------------------------------------------------------------+
-//| Стратегия 1: Усреднение (одинаковый/линейный лот)               |
-//+------------------------------------------------------------------+
 void DoAveraging(const BasketState &bs)
   {
-   if(InpSymbolScope != SCOPE_CURRENT) return; // усреднять имеет смысл по одному символу
+   if(InpSymbolScope != SCOPE_CURRENT) return;
    if(!SpreadOK(_Symbol)) return;
    if(bs.count >= InpMaxTrades) return;
-
    sym.Name(_Symbol); sym.RefreshRates();
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double bid = sym.Bid(), ask = sym.Ask();
-
-   // BUY-сторона: усредняем вниз
    if(bs.buyCount > 0)
      {
-      int needStep = CurrentStepPoints(bs.buyCount);
-      double trigger = bs.lastOpenPriceB - needStep * point;
-      if(ask <= trigger)
+      int st = CurrentStepPoints(bs.buyCount);
+      if(ask <= bs.lastOpenPriceB - st*pt)
         {
-         double lot = (InpLotAdd > 0)
-                      ? bs.lastOpenLotB + InpLotAdd
-                      : MathMax(bs.lastOpenLotB, InpStartLot);
-         lot = NormalizeLot(_Symbol, lot);
-         OpenPosition(_Symbol, ORDER_TYPE_BUY, lot, "AVG-BUY");
+         double lot = (InpLotAdd>0) ? bs.lastOpenLotB + InpLotAdd : MathMax(bs.lastOpenLotB, InpStartLot);
+         OpenPosition(_Symbol, ORDER_TYPE_BUY, NormalizeLot(_Symbol, lot), "AVG-BUY");
         }
      }
-
-   // SELL-сторона: усредняем вверх
    if(bs.sellCount > 0)
      {
-      int needStep = CurrentStepPoints(bs.sellCount);
-      double trigger = bs.lastOpenPriceS + needStep * point;
-      if(bid >= trigger)
+      int st = CurrentStepPoints(bs.sellCount);
+      if(bid >= bs.lastOpenPriceS + st*pt)
         {
-         double lot = (InpLotAdd > 0)
-                      ? bs.lastOpenLotS + InpLotAdd
-                      : MathMax(bs.lastOpenLotS, InpStartLot);
-         lot = NormalizeLot(_Symbol, lot);
-         OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "AVG-SELL");
+         double lot = (InpLotAdd>0) ? bs.lastOpenLotS + InpLotAdd : MathMax(bs.lastOpenLotS, InpStartLot);
+         OpenPosition(_Symbol, ORDER_TYPE_SELL, NormalizeLot(_Symbol, lot), "AVG-SELL");
         }
      }
   }
 
-//+------------------------------------------------------------------+
-//| Стратегия 2: Мартингейл-сетка                                    |
+
 //+------------------------------------------------------------------+
 void DoMartingale(const BasketState &bs)
   {
    if(InpSymbolScope != SCOPE_CURRENT) return;
    if(!SpreadOK(_Symbol)) return;
    if(bs.count >= InpMaxTrades) return;
-
    sym.Name(_Symbol); sym.RefreshRates();
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double bid = sym.Bid(), ask = sym.Ask();
-
    if(bs.buyCount > 0)
      {
-      int needStep = CurrentStepPoints(bs.buyCount);
-      double trigger = bs.lastOpenPriceB - needStep * point;
-      if(ask <= trigger)
+      int st = CurrentStepPoints(bs.buyCount);
+      if(ask <= bs.lastOpenPriceB - st*pt)
         {
          double lot = bs.lastOpenLotB * InpLotMultiplier;
          if(lot <= 0) lot = InpStartLot;
-         lot = NormalizeLot(_Symbol, lot);
-         OpenPosition(_Symbol, ORDER_TYPE_BUY, lot, "MG-BUY");
+         OpenPosition(_Symbol, ORDER_TYPE_BUY, NormalizeLot(_Symbol, lot), "MG-BUY");
         }
      }
-
    if(bs.sellCount > 0)
      {
-      int needStep = CurrentStepPoints(bs.sellCount);
-      double trigger = bs.lastOpenPriceS + needStep * point;
-      if(bid >= trigger)
+      int st = CurrentStepPoints(bs.sellCount);
+      if(bid >= bs.lastOpenPriceS + st*pt)
         {
          double lot = bs.lastOpenLotS * InpLotMultiplier;
          if(lot <= 0) lot = InpStartLot;
-         lot = NormalizeLot(_Symbol, lot);
-         OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "MG-SELL");
+         OpenPosition(_Symbol, ORDER_TYPE_SELL, NormalizeLot(_Symbol, lot), "MG-SELL");
         }
      }
   }
 
-//+------------------------------------------------------------------+
-//| Стратегия 3: Локирование                                         |
 //+------------------------------------------------------------------+
 void DoHedgeLock(const BasketState &bs)
   {
    if(InpSymbolScope != SCOPE_CURRENT) return;
    if(!SpreadOK(_Symbol)) return;
    if(bs.count >= InpMaxTrades) return;
-
-   // Локируем только если есть значительный убыток
    if(bs.profit > -InpLockTriggerLoss) return;
-
-   double netVol = bs.buyVolume - bs.sellVolume; // если >0 -> доминирует BUY
-   if(MathAbs(netVol) < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN)) return;
-
-   double lockLot = NormalizeLot(_Symbol, MathAbs(netVol) * InpLockLotFactor);
-   if(lockLot <= 0) return;
-
-   if(netVol > 0)
-      OpenPosition(_Symbol, ORDER_TYPE_SELL, lockLot, "LOCK");
-   else
-      OpenPosition(_Symbol, ORDER_TYPE_BUY,  lockLot, "LOCK");
+   double net = bs.buyVolume - bs.sellVolume;
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   if(MathAbs(net) < minLot) return;
+   double lot = NormalizeLot(_Symbol, MathAbs(net) * InpLockLotFactor);
+   if(lot <= 0) return;
+   if(net > 0) OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "LOCK");
+   else        OpenPosition(_Symbol, ORDER_TYPE_BUY,  lot, "LOCK");
   }
 
-//+------------------------------------------------------------------+
-//| Стратегия 4: Умное закрытие парами                              |
-//|   Идея: ищем пару (прибыльная + убыточная), сумма >= 0,         |
-//|   закрываем обе. Повторяем, пока есть такие пары.               |
+
 //+------------------------------------------------------------------+
 void DoSmartClose(const BasketState &bs)
   {
    if(bs.count < 2) return;
-
-   ulong  tickets[];
-   double profits[];
+   ulong tickets[]; double profits[];
    int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
+   for(int i=0; i<total; i++)
      {
       ulong t = PositionGetTicket(i);
       if(!IsManaged(t)) continue;
       double pft = pos.Profit() + pos.Swap() + pos.Commission();
       int n = ArraySize(tickets);
-      ArrayResize(tickets, n + 1);
-      ArrayResize(profits, n + 1);
-      tickets[n] = t;
-      profits[n] = pft;
+      ArrayResize(tickets, n+1); ArrayResize(profits, n+1);
+      tickets[n] = t; profits[n] = pft;
      }
    int n = ArraySize(tickets);
    if(n < 2) return;
-
-   // Находим самую прибыльную и самую убыточную
-   int bestIdx = 0, worstIdx = 0;
-   for(int i = 1; i < n; i++)
+   int bi = 0, wi = 0;
+   for(int i=1; i<n; i++)
      {
-      if(profits[i] > profits[bestIdx])  bestIdx  = i;
-      if(profits[i] < profits[worstIdx]) worstIdx = i;
+      if(profits[i] > profits[bi]) bi = i;
+      if(profits[i] < profits[wi]) wi = i;
      }
-   if(bestIdx == worstIdx) return;
-   if(profits[bestIdx] <= 0) return; // нечем компенсировать
-   if(profits[bestIdx] + profits[worstIdx] < InpTargetProfit) return;
-
-   if(!trade.PositionClose(tickets[bestIdx]))
-      PrintFormat("SmartClose: best #%I64u err=%d", tickets[bestIdx], trade.ResultRetcode());
-   if(!trade.PositionClose(tickets[worstIdx]))
-      PrintFormat("SmartClose: worst #%I64u err=%d", tickets[worstIdx], trade.ResultRetcode());
+   if(bi == wi) return;
+   if(profits[bi] <= 0) return;
+   double minPair = ResolveTargetMoney(0.01);
+   if(profits[bi] + profits[wi] < minPair) return;
+   trade.PositionClose(tickets[bi]);
+   trade.PositionClose(tickets[wi]);
   }
 
-//+------------------------------------------------------------------+
-//| Открыть новую позицию (для стратегий)                            |
 //+------------------------------------------------------------------+
 bool OpenPosition(const string symbol, const ENUM_ORDER_TYPE type, double lot, const string tag)
   {
    if(lot <= 0) return false;
    if(!sym.Name(symbol)) return false;
    sym.RefreshRates();
-
    double price = (type == ORDER_TYPE_BUY) ? sym.Ask() : sym.Bid();
-   string cmt   = StringFormat("%s|%s", InpComment, tag);
-
+   string cmt = StringFormat("%s|%s", InpComment, tag);
    trade.SetExpertMagicNumber(InpMagic);
    bool ok = (type == ORDER_TYPE_BUY)
              ? trade.Buy(lot, symbol, price, 0.0, 0.0, cmt)
              : trade.Sell(lot, symbol, price, 0.0, 0.0, cmt);
-
    if(!ok)
-      PrintFormat("OpenPosition %s %s %.2f failed err=%d ret=%d",
+      PrintFormat("Open %s %s %.2f failed err=%d ret=%d",
                   symbol, EnumToString(type), lot, GetLastError(), trade.ResultRetcode());
    return ok;
   }
 
+
 //+------------------------------------------------------------------+
-//| Информационная панель                                            |
+//| Panel & Buttons                                                   |
 //+------------------------------------------------------------------+
-void CreatePanel()
+void CreateLabel(const string key, int x, int y)
   {
-   string lines[] = {"title", "mode", "scope", "count", "buy", "sell", "profit", "peak", "target", "stop"};
-   int y = 20;
-   for(int i = 0; i < ArraySize(lines); i++)
+   string name = g_panelPrefix + key;
+   if(ObjectFind(0, name) < 0)
      {
-      string name = g_panelPrefix + lines[i];
-      if(ObjectFind(0, name) < 0)
-        {
-         ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
-         ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
-         ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
-         ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
-         ObjectSetInteger(0, name, OBJPROP_COLOR, InpPanelColor);
-         ObjectSetInteger(0, name, OBJPROP_FONTSIZE, InpPanelFontSize);
-         ObjectSetString (0, name, OBJPROP_FONT, "Consolas");
-         ObjectSetString (0, name, OBJPROP_TEXT, "");
-         ObjectSetInteger(0, name, OBJPROP_BACK, false);
-         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-        }
-      y += InpPanelFontSize + 6;
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, InpPanelColor);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, InpPanelFontSize);
+      ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+      ObjectSetString(0, name, OBJPROP_TEXT, "");
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
      }
   }
 
-void SetPanelLine(const string key, const string text, color clr = clrNONE)
+void CreateButton(const string name, int x, int y, int w, int h,
+                  const string text, color bg, color fg)
+  {
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+      ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+      ObjectSetInteger(0, name, OBJPROP_BGCOLOR, bg);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, fg);
+      ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrSilver);
+      ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, name, OBJPROP_TEXT, text);
+      ObjectSetInteger(0, name, OBJPROP_STATE, false);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+     }
+  }
+
+
+void CreatePanel()
+  {
+   string lines[] = {"title","mode","scope","basket","count","buy","sell","profit",
+                     "peak","target","filter","stop"};
+   int y = 20;
+   for(int i=0; i<ArraySize(lines); i++)
+     {
+      CreateLabel(lines[i], 10, y);
+      y += InpPanelFontSize + 6;
+     }
+   int btnY = y + 6;
+   int bw = 90, bh = 22, gap = 6;
+   CreateButton(BTN_CLOSE_ALL,  10,            btnY,             bw, bh, "Close All",  clrFireBrick, clrWhite);
+   CreateButton(BTN_PAUSE,      10+bw+gap,     btnY,             bw, bh, "Pause",      clrSlateGray, clrWhite);
+   CreateButton(BTN_CLOSE_BUY,  10,            btnY+bh+gap,      bw, bh, "Close BUY",  clrSteelBlue, clrWhite);
+   CreateButton(BTN_CLOSE_SELL, 10+bw+gap,     btnY+bh+gap,      bw, bh, "Close SELL", clrIndianRed, clrWhite);
+   CreateButton(BTN_LOCK,       10,            btnY+2*(bh+gap),  bw, bh, "Lock Now",   clrGoldenrod, clrBlack);
+   CreateButton(BTN_RESET,      10+bw+gap,     btnY+2*(bh+gap),  bw, bh, "Reset Stop", clrDarkGreen, clrWhite);
+  }
+
+void SetLabel(const string key, const string text, color clr = clrNONE)
   {
    string name = g_panelPrefix + key;
    if(ObjectFind(0, name) < 0) return;
    ObjectSetString(0, name, OBJPROP_TEXT, text);
-   if(clr != clrNONE)
-      ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
-   else
-      ObjectSetInteger(0, name, OBJPROP_COLOR, InpPanelColor);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, (clr == clrNONE) ? InpPanelColor : clr);
   }
+
 
 void UpdatePanel(const BasketState &bs)
   {
    if(!InpShowPanel) return;
-
    string modeName = "";
    switch(InpMode)
      {
-      case MODE_TARGET_PROFIT: modeName = "TargetProfit"; break;
-      case MODE_AVERAGING:     modeName = "Averaging";    break;
-      case MODE_MARTINGALE:    modeName = "Martingale";   break;
-      case MODE_HEDGE_LOCK:    modeName = "HedgeLock";    break;
-      case MODE_SMART_CLOSE:   modeName = "SmartClose";   break;
+      case MODE_TARGET_PROFIT: modeName="TargetProfit"; break;
+      case MODE_AVERAGING:     modeName="Averaging";    break;
+      case MODE_MARTINGALE:    modeName="Martingale";   break;
+      case MODE_HEDGE_LOCK:    modeName="HedgeLock";    break;
+      case MODE_SMART_CLOSE:   modeName="SmartClose";   break;
      }
    string scopeName = (InpManageScope==MANAGE_ALL ? "ALL"
                        : InpManageScope==MANAGE_MANUAL ? "MANUAL" : "OWN");
    string symScope  = (InpSymbolScope==SCOPE_CURRENT ? _Symbol : "ALL_SYMBOLS");
+   string basketName= (InpBasketMode==BASKET_COMBINED ? "COMBINED" : "PER_SIDE");
 
-   double target = InpTargetProfit;
-   if(InpTargetType == TARGET_PERCENT)
-      target = AccountInfoDouble(ACCOUNT_BALANCE) * InpTargetProfit / 100.0;
-
+   double tgtComb = ResolveTargetMoney(bs.buyVolume + bs.sellVolume);
+   double tgtBuy  = ResolveTargetMoney(bs.buyVolume);
+   double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetPanelLine("title",  "=== RECOVERI ===", clrGold);
-   SetPanelLine("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
-   SetPanelLine("scope",  StringFormat("Scope : %s @ %s", scopeName, symScope));
-   SetPanelLine("count",  StringFormat("Trades: %d (max %d)", bs.count, InpMaxTrades));
-   SetPanelLine("buy",    StringFormat("BUY   : %d / %.2f lot @ %.5f", bs.buyCount, bs.buyVolume, bs.buyPriceAvg));
-   SetPanelLine("sell",   StringFormat("SELL  : %d / %.2f lot @ %.5f", bs.sellCount, bs.sellVolume, bs.sellPriceAvg));
-   SetPanelLine("profit", StringFormat("P/L   : %.2f %s", bs.profit, AccountInfoString(ACCOUNT_CURRENCY)), profitClr);
-   SetPanelLine("peak",   StringFormat("Peak  : %.2f", g_basketPeakProfit));
-   SetPanelLine("target", StringFormat("Target: %.2f", target));
-   SetPanelLine("stop",   g_emergencyStop ? "STATUS: EMERGENCY STOP" : "STATUS: OK",
-                g_emergencyStop ? clrRed : clrLime);
+   SetLabel("title",  "=== RECOVERI v1.10 ===", clrGold);
+   SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
+   SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
+   SetLabel("basket", StringFormat("Basket: %s", basketName));
+   SetLabel("count",  StringFormat("Trades: %d  (max %d)", bs.count, InpMaxTrades));
+   SetLabel("buy",    StringFormat("BUY  : %d / %.2f @ %.5f  P/L %.2f",
+                                   bs.buyCount, bs.buyVolume, bs.buyPriceAvg, bs.buyProfit));
+   SetLabel("sell",   StringFormat("SELL : %d / %.2f @ %.5f  P/L %.2f",
+                                   bs.sellCount, bs.sellVolume, bs.sellPriceAvg, bs.sellProfit));
+   SetLabel("profit", StringFormat("P/L  : %.2f %s", bs.profit, AccountInfoString(ACCOUNT_CURRENCY)),
+                      profitClr);
+   if(InpBasketMode == BASKET_COMBINED)
+     {
+      SetLabel("peak",   StringFormat("Peak  : %.2f", g_peakProfit));
+      SetLabel("target", StringFormat("Target: %.2f", tgtComb));
+     }
+   else
+     {
+      SetLabel("peak",   StringFormat("Peak  : B=%.2f S=%.2f", g_peakBuyProfit, g_peakSellProfit));
+      SetLabel("target", StringFormat("Target: B=%.2f S=%.2f", tgtBuy, tgtSell));
+     }
+
+
+   string filt = "Filter:";
+   if(g_paused)         filt += " PAUSE";
+   if(InpUseTimeFilter) filt += IsTimeAllowed() ? " time-OK" : " TIME-BLK";
+   if(InpUseNewsFilter) filt += IsNewsBlocked() ? " NEWS-BLK" : " news-OK";
+   if(filt == "Filter:") filt += " none";
+   color fclr = (g_paused || g_blockReason != "") ? clrOrange : InpPanelColor;
+   SetLabel("filter", filt, fclr);
+
+   string statusText; color statusClr;
+   if(g_emergencyStop) { statusText = "STATUS: EMERGENCY STOP"; statusClr = clrRed; }
+   else if(g_paused)   { statusText = "STATUS: PAUSED";          statusClr = clrOrange; }
+   else                { statusText = "STATUS: OK";              statusClr = clrLime; }
+   SetLabel("stop", statusText, statusClr);
+
+   ObjectSetString(0, BTN_PAUSE, OBJPROP_TEXT, g_paused ? "Resume" : "Pause");
    ChartRedraw(0);
   }
-
 //+------------------------------------------------------------------+
