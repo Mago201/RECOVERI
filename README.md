@@ -1,150 +1,149 @@
-# RECOVERI — Универсальный советник для MT5
+# RECOVERI v2.00 — Hedge-Recovery EA для MT5
 
-Советник для **«разруливания» счёта из минуса**: берёт под управление существующие позиции (свои, ручные или все подряд) и закрывает их корзиной по выбранной стратегии восстановления.
+Советник для **восстановления убыточных позиций** через хеджирование с фрагментным закрытием. После активации:
 
-**Версия 1.20** — добавлены: виртуальный TSL по каждой позиции, уведомления Alert/Sound/Push, сохранение состояния между перезапусками, безусловная сетка лимитников.
+1. **Хеджирует** убыточную позицию (CORE) встречным объёмом — фиксирует просадку.
+2. Открывает **сетку восстановления** (GRID или ZONE).
+3. Когда recovery-корзина даёт `InpCycleProfit` прибыли — закрывает recovery + откусывает фрагмент от хеджа и от убыточной позиции.
+4. Повторяет циклы, пока CORE не закроется полностью. Затем закрывает остаток хеджа и переходит в IDLE.
 
-**Версия 1.10** — добавлены: закрытие по стороне, виртуальные TP/SL/безубыток, кнопки на панели, фильтры по времени и экономкалендарю.
+> ⚠️ **Требуется hedging-mode счёт MT5** (несколько встречных позиций по одному символу). На netting-счетах EA откажется запускаться.
 
 ## Установка
 
-1. Скопируйте `RECOVERI.mq5` в `<MT5>/MQL5/Experts/`.
-2. В MetaEditor — **Compile** (F7).
-3. Перетащите советника на график, разрешите автоторговлю.
+1. Скопировать `RECOVERI.mq5` в `<MT5>/MQL5/Experts/`.
+2. MetaEditor → **F7** (Compile).
+3. Перетащить на график пары, где есть убыточная ручная позиция, разрешить автоторговлю.
 
-## Стратегии восстановления (`InpMode`)
+## Логика работы (state machine)
 
-| Режим | Описание |
-|------|----------|
-| `0 TargetProfit` | Просто ждёт цели и закрывает корзину. Сам не торгует. |
-| `1 Averaging` | Усреднение в сторону убытка (одинаковый или линейно растущий лот). |
-| `2 MartingaleGrid` | Мартингейл-сетка с множителем лота. |
-| `3 HedgeLock` | Локирование чистого объёма встречной позицией. |
-| `4 SmartClose` | Парное закрытие: лучшая прибыльная + худшая убыточная. |
+```
+                    ┌─────────────────────────────────────────┐
+                    ▼                                         │
+   ┌──────┐   activate    ┌─────────┐  hedge ok   ┌──────────────┐
+   │ IDLE │──────────────►│ HEDGING │────────────►│ RECOVERING   │
+   └──────┘               └─────────┘             └──────────────┘
+       ▲                                              │
+       │  core fully recovered                        │  cycle target hit:
+       │  (after fragment cycles)                     │   - close all REC
+       └──────────────────────────────────────────────┘   - partial-close hedge & core
+                                                          - cycle++
+```
 
-## Что брать в управление
+## Активация (`InpTriggerMode`)
 
-- `InpManageScope`: `ALL` / `MANUAL` (magic==0) / `OWN` (по `InpMagic`)
-- `InpSymbolScope`: только текущий символ или все символы счёта
+- **MANUAL** — нажимаешь кнопку **Activate** на панели. EA берёт самую убыточную позицию на текущем символе (с magic ≠ InpMagic) как CORE.
+- **AUTO** — автоматически берёт самую убыточную ручную позицию, как только её убыток ≥ `InpTriggerLossMoney`.
 
-## Корзина и цель
+## Режимы восстановления (`InpRecoveryMode`)
 
-- `InpBasketMode`:
-  - `COMBINED` — единая корзина BUY+SELL, цель и трейлинг общие.
-  - `PER_SIDE` — **раздельные** корзины BUY и SELL: каждая закрывается независимо по своей цели и трейлингу.
-- `InpTargetType` — `MONEY` / `PERCENT` от баланса / `PIPS` (эквивалент в пунктах).
-- `InpTargetProfit` — значение цели.
-- `InpUseBasketTSL` + `InpBasketTSLStart` + `InpBasketTSLStep` — трейлинг корзины (общий или раздельный по сторонам).
+| Режим | Тип ордеров | Когда работает лучше |
+|-------|-------------|----------------------|
+| `GRID` | Лимитники (BUY_LIMIT/SELL_LIMIT) от текущей цены в сторону хеджа | Флэт, низкая волатильность |
+| `ZONE` | Стопы (BUY_STOP/SELL_STOP) в сторону хеджа | Тренд, продолжение движения |
 
-## Виртуальные TP/SL/Breakeven по каждой позиции
+Параметры:
+- `InpRecoveryLevels` — количество уровней (по умолчанию 5)
+- `InpRecoveryStepPts` — шаг в пунктах
+- `InpRecoveryStartLot` — лот первого уровня
+- `InpRecoveryLotMult` — множитель лота (1.0 = равные, >1 = мартингейл)
 
-В отличие от обычных SL/TP, эти **не выставляются на сервер** — брокер их не видит, советник закрывает позиции сам по достижении уровня:
+## Positive Grid (опционально)
 
-- `InpUseVirtualTP` + `InpVirtualTPPts` — закрытие при +N пунктов.
-- `InpUseVirtualSL` + `InpVirtualSLPts` — закрытие при −N пунктов.
-- `InpUseVirtualBE` + `InpVirtualBEPts` — после прохождения +N пунктов фиксируется виртуальный безубыток: при возврате в 0 позиция закрывается.
+`InpUsePositiveGrid` — позволяет добавлять recovery-позиции **в направлении движения цены в нашу пользу**, ускоряя восстановление.
 
-Работают одновременно для всех управляемых позиций (свои/ручные).
+- `InpPosGridStepPts` — каждые N пунктов благоприятного движения добавляется новая позиция в сторону хеджа.
+- `InpPosGridMinDistTPPts` — мягкий гейт: если cycle P/L уже ≥ 80% цели, новые positive-grid ордера не открываются (мы и так почти у цели).
 
-## Виртуальный трейлинг-стоп по каждой позиции
+## Фрагментное закрытие (ядро стратегии)
 
-`InpUseVirtualTSL` — после того как позиция набрала `InpVirtualTSLStartPts` пунктов прибыли, советник запоминает пик и закрывает позицию, если профит просел на `InpVirtualTSLDistPts` пунктов от пика. Тоже виртуальный — на сервере SL не выставляется.
+Когда recovery-корзина даёт прибыль ≥ `InpCycleProfit`:
+1. Закрываются **все** recovery-позиции и pending-ордера → банкуется прибыль.
+2. От HEDGE отрезается фрагмент `InpFragmentLot` (через `PositionClosePartial`).
+3. От CORE отрезается фрагмент `InpFragmentLot`.
+4. Цикл инкрементируется, новые recovery-ордера ставятся на следующем тике.
 
-Работает параллельно с обычными vTP/vSL/vBE и независимо для каждого тикета.
+Фрагменты HEDGE и CORE равны → нетто-объём остаётся 0 (просадка по-прежнему заблокирована), но **часть исходного убытка реализована**, и компенсирована прибылью recovery.
 
-## Уведомления
+Когда CORE опустошён — закрывается остаток HEDGE → IDLE.
 
-`InpUseAlert` (всплывающее окно), `InpUseSound` + `InpSoundFile`, `InpUsePush` (Push на телефон через Tools → Options → Notifications). Срабатывают на: vTP/vSL/vBE/vTSL, цель корзины, трейлинг корзины, EmergencyStop.
-
-## Сохранение состояния (Persistence)
-
-`InpUsePersistence` — состояние пишется в `GlobalVariables` под префиксом `RECOVERI_<symbol>_<magic>_` и переживает перезапуск терминала / реинициализацию советника:
-- флаг **Paused** и **EmergencyStop**;
-- пики корзины (общий и раздельные BUY/SELL);
-- **виртуальный безубыток** по каждой позиции (тикеты, у которых уже сработал триггер BE);
-- **пики виртуального TSL** по каждой позиции;
-- факт того, что **сетка уже была выставлена** (чтобы не переоткрывать после рестарта).
-
-При выгрузке советника (`OnDeinit`) состояние сохраняется. При запуске (`OnInit`) — загружается. Ключи привязаны к символу + magic, поэтому можно запускать несколько копий советника на разных парах одновременно.
-
-## Безусловная сетка лимитников
-
-`InpUseUncondGrid` — при первом запуске сразу выставляет N уровней лимитников (BUY_LIMIT ниже рынка / SELL_LIMIT выше — «фейд»-сетка для восстановления):
-- `InpGridSide`: `BOTH` / `BUY` / `SELL` (только одна сторона).
-- `InpGridLevels` — количество уровней.
-- `InpGridStepPoints` — шаг между уровнями (с учётом минимального `STOPS_LEVEL` брокера).
-- `InpGridStartLot` + `InpGridLotMultiplier` — лот первого уровня и множитель (1.0 = одинаковые лоты, >1 = мартингейл).
-- `InpGridReplaceFilled` — переоткрывать сработавшие уровни на текущем рынке.
-
-Сработавший лимитник превращается в позицию и автоматически попадает под управление советника (закрытие по цели корзины, виртуальные TP/SL/TSL и т.д.).
-
-## Кнопки на графике
+## Кнопки панели
 
 | Кнопка | Действие |
 |--------|----------|
-| **Close All**   | Закрыть все управляемые позиции |
-| **Pause / Resume** | Поставить советник на паузу (не открывает новые сделки, но продолжает следить за TP/SL и целью корзины) |
-| **Close BUY**   | Закрыть только BUY-сторону |
-| **Close SELL**  | Закрыть только SELL-сторону |
-| **Lock Now**    | Сразу залочить чистый объём встречной позицией |
-| **Reset Stop**  | Сбросить аварийный equity-стоп |
-
-## Фильтр времени
-
-`InpUseTimeFilter`:
-- `InpStartHour` / `InpEndHour` — окно работы (если start > end — переход через полночь).
-- `InpTradeMon..InpTradeSun` — флаги дней недели.
-
-Фильтр блокирует **только открытие** новых сделок стратегиями. Закрытие, виртуальные SL/TP, цель корзины и аварийный стоп работают всегда.
-
-## Новостной фильтр (экономкалендарь MT5)
-
-`InpUseNewsFilter` — использует **встроенный** календарь MT5 (`CalendarValueHistoryByCurrency`), внешние API не нужны.
-
-- `InpNewsHigh` / `InpNewsMedium` / `InpNewsLow` — по каким уровням важности блокировать.
-- `InpNewsMinsBefore` / `InpNewsMinsAfter` — окно до и после события (мин).
-- Фильтр срабатывает по **обеим валютам символа** (base + profit). На индексах/металлах — пропускается.
+| **Activate** | (только в IDLE) взять самую убыточную позицию как CORE и начать хеджирование |
+| **Pause** / **Resume** | Поставить state-machine на паузу. Ордера не закрываются, но новые циклы не запускаются. |
+| **Stop / Reset** | Закрыть **всё** (recovery + hedge), сбросить state в IDLE. CORE-позиция (если она была ручная и до конца не отработана) **остаётся открытой** — её придётся закрыть руками. |
 
 ## Защита счёта
 
-- `InpUseEquityStop` + `InpEquityStopPct` — аварийное закрытие, если equity упало ниже % от баланса. Стоп держит состояние до сброса кнопкой **Reset Stop**.
-- `InpCloseOnly` — режим «только закрытие».
-- `InpMaxTrades`, `InpMaxLot`, `InpMaxSpreadPts` — предохранители.
+`InpUseEquityStop` + `InpEquityStopPct` — если equity / balance × 100 ≤ порога, EA закрывает все свои позиции (recovery + hedge) и переходит в `EMERGENCY`. CORE при этом тоже закрывается через `CloseAllPositions()`. Восстановление — только перезапуск EA.
 
-## Типовые сценарии
+## Persistence (переживание рестарта)
 
-**1) «Закрой ручные сделки в плюсе $10 на любом символе»**
-```
-InpMode = 0 (TargetProfit), InpManageScope = 1 (MANUAL), InpSymbolScope = 1 (ALL)
-InpTargetProfit = 10.0, InpCloseOnly = true
-```
+`InpUsePersistence = true` — состояние пишется в `GlobalVariables`:
+- state, ticket CORE/HEDGE, начальный объём CORE, last positive-grid price, номер цикла.
 
-**2) «Усредни ручную убыточную EURUSD до безубытка, не торгуй на новостях NFP»**
-```
-EA на графике EURUSD
-InpMode = 1 (Averaging), InpManageScope = 1 (MANUAL), InpSymbolScope = 0 (CURRENT)
-InpStepPoints = 300, InpStepMultiplier = 1.2, InpStartLot = 0.01, InpMaxTrades = 8
-InpTargetProfit = 5.0
-InpUseNewsFilter = true, InpNewsHigh = true, InpNewsMinsBefore=30, InpNewsMinsAfter=30
-```
+Префикс ключей: `RECOVERI_<symbol>_<magic>_`. Можно запускать несколько экземпляров EA на разных парах одновременно.
 
-**3) «Раздельные BUY и SELL корзины, каждая в +$5, по виртуальному SL −500 пт»**
-```
-InpBasketMode = 1 (PER_SIDE)
-InpTargetProfit = 5.0
-InpUseVirtualSL = true, InpVirtualSLPts = 500
-```
+## Фильтры времени и новостей
 
-**4) «Только европейская сессия, мартингейл с трейлингом»**
-```
-InpMode = 2, InpUseTimeFilter = true, InpStartHour = 9, InpEndHour = 18
-InpUseBasketTSL = true, InpBasketTSLStart = 30, InpBasketTSLStep = 10
-```
+- `InpUseTimeFilter` + `InpStartHour`/`InpEndHour` — окно работы. Блокирует **только открытие** новых hedge/recovery — закрытие циклов и emergency-stop работают всегда.
+- `InpUseNewsFilter` — встроенный экономкалендарь MT5, по обеим валютам символа. Уровни: `InpNewsHigh` / `InpNewsMedium`. Окно: `InpNewsMinsBefore` / `InpNewsMinsAfter`.
+
+## Уведомления
+
+`InpUseAlert` (всплывашка), `InpUseSound` + `InpSoundFile`, `InpUsePush` (телефон через Tools → Options → Notifications). Срабатывают на: adopt CORE, hedge open, cycle target, recovery complete, emergency stop, аварии.
 
 ## Информационная панель
 
-Показывает: режим, область управления, тип корзины, кол-во позиций, BUY/SELL объёмы и средневзвешенные цены, P/L каждой стороны и общий, пик(и), цель(и), активные фильтры (PAUSE/TIME/NEWS), статус.
+Показывает в реальном времени: state, режим/триггер, CORE (тикет, объём текущий/начальный, цена, P/L), HEDGE, номер цикла, число открытых recovery-позиций и pending-ордеров, P/L текущего цикла vs цель, статус Positive Grid.
+
+## Типовые сценарии
+
+**1) «Спасти ручную BUY EUR/USD 0.05 в просадке −20$ через grid»**
+```
+InpTriggerMode      = MANUAL
+InpRecoveryMode     = GRID
+InpRecoveryLevels   = 5
+InpRecoveryStepPts  = 200
+InpRecoveryStartLot = 0.01
+InpFragmentLot      = 0.01
+InpCycleProfit      = 1.0
+```
+Открыть EA на EURUSD → нажать **Activate**. EA откроет SELL 0.05 хедж + 5 BuyLimit ниже рынка. По мере отскоков частично закрывает 0.01 от core+hedge раз в цикл (~$1 прибыли).
+
+**2) «Авто-режим, агрессивный с positive-grid в тренде»**
+```
+InpTriggerMode      = AUTO
+InpTriggerLossMoney = 10
+InpRecoveryMode     = ZONE
+InpRecoveryLevels   = 5
+InpRecoveryStepPts  = 150
+InpRecoveryLotMult  = 1.2          (мартингейл-сетка)
+InpUsePositiveGrid  = true
+InpPosGridStepPts   = 80
+InpFragmentLot      = 0.01
+InpCycleProfit      = 2.0
+InpUseEquityStop    = true
+InpEquityStopPct    = 60
+```
+
+**3) «Только европейская сессия, без новостей»**
+```
+InpUseTimeFilter   = true,  InpStartHour = 9,  InpEndHour = 18
+InpUseNewsFilter   = true,  InpNewsHigh  = true, InpNewsMinsBefore = 30, InpNewsMinsAfter = 30
+```
+
+## Что выкинуто из v1.20
+
+- Старые режимы (Averaging / Martingale / HedgeLock / SmartClose) — заменены единой стратегией Hedge-Recovery.
+- Виртуальные TP/SL/BE/TSL по каждой позиции — не нужны в hedge-recovery.
+- Старая безусловная сетка лимитников — заменена recovery-grid внутри state machine.
+- Управление чужими позициями (manual-mode/own-mode) — теперь EA адоптирует одну CORE-позицию, и работает только с ней + своими hedge/recovery.
+
+Если для прежней логики нужен старый файл — он остался в истории коммитов до v2.0.
 
 ## Дисклеймер
 
-Усреднение, мартингейл и локирование увеличивают риск потери счёта. Сначала тестер стратегий и демо. Обязательно включайте `InpUseEquityStop`. Автор ответственности не несёт.
+Hedge-recovery с мартингейлом/фрагментацией — высокорисковая техника. На сильном тренде против CORE без `EquityStop` — слив. Тестируй в Strategy Tester на исторических данных, потом на демо. Автор ответственности не несёт.
