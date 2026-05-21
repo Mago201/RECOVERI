@@ -747,7 +747,7 @@ bool IsNewsBlocked()
      {
       if(list[i] == "") continue;
       MqlCalendarValue values[];
-      int n = CalendarValueHistoryByCurrency(list[i], values, from, to);
+      int n = CalendarValueHistory(values, from, to, NULL, list[i]);
       for(int k=0; k<n; k++)
         {
          MqlCalendarEvent ev;
