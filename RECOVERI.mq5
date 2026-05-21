@@ -154,6 +154,7 @@ input int                InpGridStepPoints    = 200;
 input double             InpGridStartLot      = 0.01;
 input double             InpGridLotMultiplier = 1.0;     // 1.0 = одинаковый лот, >1 = мартингейл-сетка
 input bool               InpGridReplaceFilled = false;   // переоткрывать сработавшие уровни
+input bool               InpGridAutoRestart   = true;    // после Close All автоматически выставлять сетку заново
 
 input group "=== Панель ==="
 input bool               InpShowPanel     = true;
@@ -247,6 +248,14 @@ void OnTick()
 
    if(InpUseUncondGrid && InpGridReplaceFilled)
       ReplenishGrid();
+
+   // Auto-restart unconditional grid after Close All / emergency stop
+   if(InpUseUncondGrid && InpGridAutoRestart && !g_gridPlaced && !g_emergencyStop && !g_paused
+      && IsTradingAllowed())
+     {
+      PlaceUnconditionalGrid();
+      g_gridPlaced = true;
+     }
 
 
    BasketState bs;
@@ -443,6 +452,10 @@ void CloseAllManaged()
    for(int i=0; i<ArraySize(tickets); i++)
       if(!trade.PositionClose(tickets[i], (ulong)InpSlippage))
          PrintFormat("Close #%I64u err=%d", tickets[i], trade.ResultRetcode());
+
+   // Wipe pending grid orders too, so "Close All" really resets state
+   DeleteAllManagedPending();
+   g_gridPlaced = false;
   }
 
 //+------------------------------------------------------------------+
@@ -460,6 +473,10 @@ void CloseSide(const ENUM_POSITION_TYPE side)
    for(int i=0; i<ArraySize(tickets); i++)
       if(!trade.PositionClose(tickets[i], (ulong)InpSlippage))
          PrintFormat("CloseSide #%I64u err=%d", tickets[i], trade.ResultRetcode());
+
+   // Drop matching-side pending limits as well
+   ENUM_ORDER_TYPE pendType = (side == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
+   DeleteManagedPendingSide(pendType);
   }
 
 
@@ -1141,25 +1158,55 @@ void ReplenishGrid()
    int haveSell = CountManagedPending(ORDER_TYPE_SELL_LIMIT);
    if(haveBuy >= wantBuy && haveSell >= wantSell) return;
 
-   sym.Name(_Symbol); sym.RefreshRates();
-   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double bid = sym.Bid(), ask = sym.Ask();
-   long   stopsPts = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double stopsDist = (double)stopsPts * pt;
+   // Re-anchor: drop remaining pending and re-place full grid from current price.
+   // Avoids price-collision with old levels and keeps grid spacing consistent.
+   DeleteAllManagedPending();
+   PlaceUnconditionalGrid();
+  }
 
-   trade.SetExpertMagicNumber(InpMagic);
-   int needB = wantBuy  - haveBuy;
-   int needS = wantSell - haveSell;
-   for(int i = 1; i <= MathMax(needB, needS); i++)
+//+------------------------------------------------------------------+
+//| Pending order helpers                                            |
+//+------------------------------------------------------------------+
+bool IsManagedPending(const ulong ticket)
+  {
+   if(!OrderSelect(ticket)) return false;
+   if(InpSymbolScope == SCOPE_CURRENT && OrderGetString(ORDER_SYMBOL) != _Symbol) return false;
+   long m = OrderGetInteger(ORDER_MAGIC);
+   if(InpManageScope == MANAGE_MANUAL && m != 0)        return false;
+   if(InpManageScope == MANAGE_OWN    && m != InpMagic) return false;
+   return true;
+  }
+
+void DeleteAllManagedPending()
+  {
+   ulong tickets[];
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
      {
-      double off = i * InpGridStepPoints * pt;
-      if(off < stopsDist) off = stopsDist + pt;
-      double lot = GridLot(i-1);
-      string cmt = StringFormat("%s|GRID-R%d", InpComment, i);
-      if(i <= needB)
-         trade.BuyLimit(lot,  NormalizeDouble(ask - off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-B");
-      if(i <= needS)
-         trade.SellLimit(lot, NormalizeDouble(bid + off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-S");
+      ulong tk = OrderGetTicket(i);
+      if(tk == 0) continue;
+      if(!IsManagedPending(tk)) continue;
+      int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = tk;
      }
+   for(int i=0; i<ArraySize(tickets); i++)
+      if(!trade.OrderDelete(tickets[i]))
+         PrintFormat("OrderDelete #%I64u err=%d", tickets[i], trade.ResultRetcode());
+  }
+
+void DeleteManagedPendingSide(const ENUM_ORDER_TYPE pendType)
+  {
+   ulong tickets[];
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong tk = OrderGetTicket(i);
+      if(tk == 0) continue;
+      if(!IsManagedPending(tk)) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != pendType) continue;
+      int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = tk;
+     }
+   for(int i=0; i<ArraySize(tickets); i++)
+      if(!trade.OrderDelete(tickets[i]))
+         PrintFormat("OrderDelete #%I64u err=%d", tickets[i], trade.ResultRetcode());
   }
 //+------------------------------------------------------------------+
