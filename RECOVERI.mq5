@@ -1,8 +1,12 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.30                                                           |
-//|  Добавлено в v1.30:                                              |
+//|  v1.31                                                           |
+//|  Добавлено в v1.31:                                              |
+//|    - Кнопки ручного открытия BUY/SELL на панели                  |
+//|      (для теста стратегии в визуальном режиме и на лайве)        |
+//|    - Все input-параметры переведены на русский                   |
+//|  v1.30:                                                          |
 //|    - Авто-распил (раскулачивание) лока в режиме HedgeLock        |
 //|      Фазы: IDLE -> LOCKED -> UNWOUND -> (RELOCKED) -> ...        |
 //|      Закрытие выгодной ноги по цели/трейлингу                    |
@@ -21,7 +25,7 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.30"
+#property version   "1.31"
 #property strict
 #property description "Universal MT5 Recovery EA - basket recovery from drawdown"
 
@@ -33,159 +37,163 @@
 //=== Enums ==========================================================
 enum ENUM_RECOVERY_MODE
   {
-   MODE_TARGET_PROFIT = 0,    // 0: TargetProfit
-   MODE_AVERAGING     = 1,    // 1: Averaging
-   MODE_MARTINGALE    = 2,    // 2: Martingale grid
-   MODE_HEDGE_LOCK    = 3,    // 3: HedgeLock
-   MODE_SMART_CLOSE   = 4     // 4: SmartClose
+   MODE_TARGET_PROFIT = 0,    // 0: Только закрытие по цели
+   MODE_AVERAGING     = 1,    // 1: Усреднение
+   MODE_MARTINGALE    = 2,    // 2: Мартингейл-сетка
+   MODE_HEDGE_LOCK    = 3,    // 3: Хедж-лок
+   MODE_SMART_CLOSE   = 4     // 4: Парное закрытие (SmartClose)
   };
 
 enum ENUM_MANAGE_SCOPE
   {
-   MANAGE_ALL    = 0,         // 0: All positions
-   MANAGE_MANUAL = 1,         // 1: Manual only (magic==0)
-   MANAGE_OWN    = 2          // 2: Own only (by InpMagic)
+   MANAGE_ALL    = 0,         // 0: Все позиции
+   MANAGE_MANUAL = 1,         // 1: Только ручные (magic==0)
+   MANAGE_OWN    = 2          // 2: Только свои (по InpMagic)
   };
 
 enum ENUM_SYMBOL_SCOPE
   {
-   SCOPE_CURRENT = 0,         // 0: Current symbol
-   SCOPE_ALL     = 1          // 1: All symbols
+   SCOPE_CURRENT = 0,         // 0: Текущий символ
+   SCOPE_ALL     = 1          // 1: Все символы
   };
 
 enum ENUM_TARGET_TYPE
   {
-   TARGET_MONEY   = 0,        // 0: Money
-   TARGET_PERCENT = 1,        // 1: Percent of balance
-   TARGET_PIPS    = 2         // 2: Pips equivalent
+   TARGET_MONEY   = 0,        // 0: Деньги (валюта депо)
+   TARGET_PERCENT = 1,        // 1: % от баланса
+   TARGET_PIPS    = 2         // 2: Эквивалент в пунктах
   };
 
 
 enum ENUM_BASKET_MODE
   {
-   BASKET_COMBINED = 0,       // 0: Combined BUY+SELL basket
-   BASKET_PER_SIDE = 1        // 1: Separate BUY and SELL baskets
+   BASKET_COMBINED = 0,       // 0: Общая корзина BUY+SELL
+   BASKET_PER_SIDE = 1        // 1: Раздельные корзины BUY и SELL
   };
 
 enum ENUM_GRID_SIDE
   {
-   GRID_BOTH = 0,             // 0: Both sides (BUY_LIMIT below + SELL_LIMIT above)
-   GRID_BUY  = 1,             // 1: BUY_LIMIT only (below market)
-   GRID_SELL = 2              // 2: SELL_LIMIT only (above market)
+   GRID_BOTH = 0,             // 0: Обе стороны (BUY_LIMIT + SELL_LIMIT)
+   GRID_BUY  = 1,             // 1: Только BUY_LIMIT (ниже рынка)
+   GRID_SELL = 2              // 2: Только SELL_LIMIT (выше рынка)
   };
 
 enum ENUM_LOCK_PHASE
   {
-   PHASE_IDLE     = 0,        // 0: no lock
-   PHASE_LOCKED   = 1,        // 1: both sides open (locked)
-   PHASE_UNWOUND  = 2,        // 2: one side closed, managing remaining side
-   PHASE_RELOCKED = 3         // 3: counter-lock opened on top of remaining side
+   PHASE_IDLE     = 0,        // 0: лока нет
+   PHASE_LOCKED   = 1,        // 1: обе стороны открыты (лок)
+   PHASE_UNWOUND  = 2,        // 2: одна нога закрыта, ведём оставшуюся
+   PHASE_RELOCKED = 3         // 3: переоткрыт встречный лок поверх остатка
   };
 
 //=== Inputs =========================================================
 input group "=== Общие ==="
-input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;
-input ENUM_MANAGE_SCOPE  InpManageScope   = MANAGE_ALL;
-input ENUM_SYMBOL_SCOPE  InpSymbolScope   = SCOPE_CURRENT;
-input long               InpMagic         = 20260520;
-input string             InpComment       = "RECOVERI";
-input int                InpSlippage      = 30;
-input double             InpMaxSpreadPts  = 0;
+input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;  // Режим восстановления
+input ENUM_MANAGE_SCOPE  InpManageScope   = MANAGE_ALL;          // Какие позиции брать в управление
+input ENUM_SYMBOL_SCOPE  InpSymbolScope   = SCOPE_CURRENT;       // Область по символу
+input long               InpMagic         = 20260520;            // Magic number советника
+input string             InpComment       = "RECOVERI";          // Комментарий к ордерам
+input int                InpSlippage      = 30;                  // Допустимое проскальзывание (пункты)
+input double             InpMaxSpreadPts  = 0;                   // Макс. спред (пункты, 0 = не проверять)
 
 input group "=== Корзина и цель ==="
-input ENUM_BASKET_MODE   InpBasketMode    = BASKET_COMBINED;
-input ENUM_TARGET_TYPE   InpTargetType    = TARGET_MONEY;
-input double             InpTargetProfit  = 10.0;
-input bool               InpUseBasketTSL  = false;
-input double             InpBasketTSLStart= 20.0;
-input double             InpBasketTSLStep = 5.0;
+input ENUM_BASKET_MODE   InpBasketMode    = BASKET_COMBINED;     // Режим корзины
+input ENUM_TARGET_TYPE   InpTargetType    = TARGET_MONEY;        // Тип цели
+input double             InpTargetProfit  = 10.0;                // Значение цели
+input bool               InpUseBasketTSL  = false;               // Включить трейлинг корзины
+input double             InpBasketTSLStart= 20.0;                // Старт трейлинга (профит корзины)
+input double             InpBasketTSLStep = 5.0;                 // Откат от пика для закрытия
 
 input group "=== Виртуальные TP/SL ==="
-input bool               InpUseVirtualTP  = false;
-input int                InpVirtualTPPts  = 200;
-input bool               InpUseVirtualSL  = false;
-input int                InpVirtualSLPts  = 1000;
-input bool               InpUseVirtualBE  = false;
-input int                InpVirtualBEPts  = 100;
+input bool               InpUseVirtualTP  = false;               // Включить виртуальный TP
+input int                InpVirtualTPPts  = 200;                 // Виртуальный TP (пункты)
+input bool               InpUseVirtualSL  = false;               // Включить виртуальный SL
+input int                InpVirtualSLPts  = 1000;                // Виртуальный SL (пункты)
+input bool               InpUseVirtualBE  = false;               // Включить виртуальный безубыток
+input int                InpVirtualBEPts  = 100;                 // Триггер безубытка (пункты)
 
 input group "=== Виртуальный трейлинг-стоп (по каждой позиции) ==="
-input bool               InpUseVirtualTSL  = false;
-input int                InpVirtualTSLStartPts = 200;  // профит для активации трейлинга (пункты)
-input int                InpVirtualTSLDistPts  = 100;  // расстояние трейлинга от пика (пункты)
+input bool               InpUseVirtualTSL  = false;              // Включить трейлинг по позициям
+input int                InpVirtualTSLStartPts = 200;            // Профит для активации трейлинга (пункты)
+input int                InpVirtualTSLDistPts  = 100;            // Расстояние трейлинга от пика (пункты)
 
 input group "=== Стратегии (Averaging/Martingale) ==="
-input double             InpStartLot      = 0.01;
-input double             InpLotMultiplier = 1.5;
-input double             InpLotAdd        = 0.0;
-input int                InpStepPoints    = 300;
-input double             InpStepMultiplier= 1.2;
-input int                InpMaxTrades     = 10;
-input double             InpMaxLot        = 1.0;
+input double             InpStartLot      = 0.01;                // Стартовый лот
+input double             InpLotMultiplier = 1.5;                 // Множитель лота (мартингейл)
+input double             InpLotAdd        = 0.0;                 // Прибавка к лоту (усреднение, 0 = не использовать)
+input int                InpStepPoints    = 300;                 // Базовый шаг сетки (пункты)
+input double             InpStepMultiplier= 1.2;                 // Множитель шага сетки
+input int                InpMaxTrades     = 10;                  // Макс. позиций в корзине
+input double             InpMaxLot        = 1.0;                 // Лимит лота на одну позицию
 
 input group "=== HedgeLock ==="
-input double             InpLockTriggerLoss= 50.0;
-input double             InpLockLotFactor = 1.0;
+input double             InpLockTriggerLoss= 50.0;               // Убыток корзины для открытия лока (валюта депо)
+input double             InpLockLotFactor = 1.0;                 // Доля чистого объёма для лока (1.0 = 100%)
 
 
 input group "=== Авто-распил лока (Mode 3) ==="
-input bool               InpAutoUnlock          = false;   // включить авто-распил после лока
-input double             InpUnlockProfitUSD     = 30.0;    // профит ОДНОЙ ноги для её закрытия (в валюте депо)
-input bool               InpUseSideTSL          = true;    // трейлинг профита ноги при распиле
-input double             InpUnlockTSLStart      = 50.0;    // пик профита ноги для активации TSL
-input double             InpUnlockTSLStep       = 20.0;    // откат от пика для закрытия ноги
-input bool               InpEnableRelock        = false;   // переоткрывать частичный встречный лок при провале
-input double             InpRelockTriggerLoss   = 80.0;    // убыток на оставшейся ноге для перелока (в валюте депо)
-input double             InpRelockLotFactor     = 0.5;     // доля объёма оставшейся ноги для перелока (0..1)
-input int                InpMaxRelocks          = 2;       // максимум последовательных перелоков
+input bool               InpAutoUnlock          = false;   // Включить авто-распил после лока
+input double             InpUnlockProfitUSD     = 30.0;    // Профит ОДНОЙ ноги для её закрытия (валюта депо)
+input bool               InpUseSideTSL          = true;    // Трейлинг профита ноги при распиле
+input double             InpUnlockTSLStart      = 50.0;    // Пик профита ноги для активации TSL
+input double             InpUnlockTSLStep       = 20.0;    // Откат от пика для закрытия ноги
+input bool               InpEnableRelock        = false;   // Переоткрывать частичный встречный лок при провале
+input double             InpRelockTriggerLoss   = 80.0;    // Убыток на оставшейся ноге для перелока (валюта депо)
+input double             InpRelockLotFactor     = 0.5;     // Доля объёма оставшейся ноги для перелока (0..1]
+input int                InpMaxRelocks          = 2;       // Максимум последовательных перелоков
 
 
 input group "=== Защита счёта ==="
-input bool               InpUseEquityStop = false;
-input double             InpEquityStopPct = 50.0;
-input bool               InpCloseOnly     = false;
+input bool               InpUseEquityStop = false;               // Включить аварийный equity-стоп
+input double             InpEquityStopPct = 50.0;                // Порог equity (% от баланса)
+input bool               InpCloseOnly     = false;               // Только закрытие (новые сделки не открывать)
 
 input group "=== Фильтр времени ==="
-input bool               InpUseTimeFilter = false;
-input int                InpStartHour     = 0;
-input int                InpEndHour       = 24;
-input bool               InpTradeMon      = true;
-input bool               InpTradeTue      = true;
-input bool               InpTradeWed      = true;
-input bool               InpTradeThu      = true;
-input bool               InpTradeFri      = true;
-input bool               InpTradeSat      = false;
-input bool               InpTradeSun      = false;
+input bool               InpUseTimeFilter = false;               // Включить фильтр времени
+input int                InpStartHour     = 0;                   // Начало торгового окна (час 0..24)
+input int                InpEndHour       = 24;                  // Конец торгового окна (час 0..24)
+input bool               InpTradeMon      = true;                // Понедельник
+input bool               InpTradeTue      = true;                // Вторник
+input bool               InpTradeWed      = true;                // Среда
+input bool               InpTradeThu      = true;                // Четверг
+input bool               InpTradeFri      = true;                // Пятница
+input bool               InpTradeSat      = false;               // Суббота
+input bool               InpTradeSun      = false;               // Воскресенье
 
 input group "=== Новостной фильтр (MT5 Calendar) ==="
-input bool               InpUseNewsFilter = false;
-input bool               InpNewsHigh      = true;
-input bool               InpNewsMedium    = false;
-input bool               InpNewsLow       = false;
-input int                InpNewsMinsBefore= 30;
-input int                InpNewsMinsAfter = 30;
+input bool               InpUseNewsFilter = false;               // Включить новостной фильтр
+input bool               InpNewsHigh      = true;                // Блокировать события High
+input bool               InpNewsMedium    = false;               // Блокировать события Medium
+input bool               InpNewsLow       = false;               // Блокировать события Low
+input int                InpNewsMinsBefore= 30;                  // Минут до события
+input int                InpNewsMinsAfter = 30;                  // Минут после события
 
 input group "=== Уведомления ==="
-input bool               InpUseAlert      = true;       // всплывающий Alert()
-input bool               InpUseSound      = false;      // звук
-input string             InpSoundFile     = "alert.wav";
-input bool               InpUsePush       = false;      // Push на телефон (Settings -> Notifications)
+input bool               InpUseAlert      = true;                // Всплывающий Alert()
+input bool               InpUseSound      = false;               // Звук
+input string             InpSoundFile     = "alert.wav";         // Звуковой файл
+input bool               InpUsePush       = false;               // Push на телефон (Settings -> Notifications)
 
 input group "=== Сохранение состояния ==="
-input bool               InpUsePersistence= true;       // сохранять paused/BE/TSL/peaks через GlobalVariables
+input bool               InpUsePersistence= true;                // Сохранять paused/BE/TSL/peaks через GlobalVariables
 
 input group "=== Безусловная сетка (limit-ордера) ==="
-input bool               InpUseUncondGrid     = false;
-input ENUM_GRID_SIDE     InpGridSide          = GRID_BOTH;
-input int                InpGridLevels        = 5;
-input int                InpGridStepPoints    = 200;
-input double             InpGridStartLot      = 0.01;
-input double             InpGridLotMultiplier = 1.0;     // 1.0 = одинаковый лот, >1 = мартингейл-сетка
-input bool               InpGridReplaceFilled = false;   // переоткрывать сработавшие уровни
+input bool               InpUseUncondGrid     = false;           // Включить безусловную сетку лимитников
+input ENUM_GRID_SIDE     InpGridSide          = GRID_BOTH;       // Сторона сетки
+input int                InpGridLevels        = 5;               // Количество уровней
+input int                InpGridStepPoints    = 200;             // Шаг между уровнями (пункты)
+input double             InpGridStartLot      = 0.01;            // Лот первого уровня
+input double             InpGridLotMultiplier = 1.0;             // Множитель лота (1.0 = одинаковый, >1 = мартингейл)
+input bool               InpGridReplaceFilled = false;           // Переоткрывать сработавшие уровни
+
+input group "=== Ручная торговля (тестер/график) ==="
+input bool               InpShowManualButtons = true;            // Показывать кнопки ручного открытия BUY/SELL
+input double             InpManualLot         = 0.01;            // Лот для ручных кнопок BUY/SELL
 
 input group "=== Панель ==="
-input bool               InpShowPanel     = true;
-input color              InpPanelColor    = clrWhite;
-input int                InpPanelFontSize = 10;
+input bool               InpShowPanel     = true;                // Показывать панель на графике
+input color              InpPanelColor    = clrWhite;            // Цвет текста панели
+input int                InpPanelFontSize = 10;                  // Размер шрифта панели
 
 //=== Globals ========================================================
 CTrade         trade;
@@ -232,12 +240,14 @@ int     g_relockCount    = 0;
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
 
-#define BTN_CLOSE_ALL  "RECOVERI_BTN_CLOSE_ALL"
-#define BTN_CLOSE_BUY  "RECOVERI_BTN_CLOSE_BUY"
-#define BTN_CLOSE_SELL "RECOVERI_BTN_CLOSE_SELL"
-#define BTN_PAUSE      "RECOVERI_BTN_PAUSE"
-#define BTN_LOCK       "RECOVERI_BTN_LOCK"
-#define BTN_RESET      "RECOVERI_BTN_RESET"
+#define BTN_CLOSE_ALL    "RECOVERI_BTN_CLOSE_ALL"
+#define BTN_CLOSE_BUY    "RECOVERI_BTN_CLOSE_BUY"
+#define BTN_CLOSE_SELL   "RECOVERI_BTN_CLOSE_SELL"
+#define BTN_PAUSE        "RECOVERI_BTN_PAUSE"
+#define BTN_LOCK         "RECOVERI_BTN_LOCK"
+#define BTN_RESET        "RECOVERI_BTN_RESET"
+#define BTN_MANUAL_BUY   "RECOVERI_BTN_MANUAL_BUY"
+#define BTN_MANUAL_SELL  "RECOVERI_BTN_MANUAL_SELL"
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -293,13 +303,15 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetMarginMode();
    trade.LogLevel(LOG_LEVEL_ERRORS);
+   if(InpShowManualButtons && InpManualLot <= 0)
+      Print("WARNING: InpShowManualButtons=true but InpManualLot<=0; manual buttons will refuse to open.");
    g_gvPrefix = StringFormat("RECOVERI_%s_%I64d_", _Symbol, InpMagic);
    if(InpUsePersistence) LoadState();
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.30 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Magic=%I64d",
+   PrintFormat("RECOVERI v1.31 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Magic=%I64d ManualBtn=%d ManualLot=%.2f",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
-               (int)InpAutoUnlock, InpMagic);
+               (int)InpAutoUnlock, InpMagic, (int)InpShowManualButtons, InpManualLot);
    return INIT_SUCCEEDED;
   }
 
@@ -362,6 +374,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    else if(sparam == BTN_PAUSE)      { g_paused = !g_paused; PrintFormat("BTN: Pause=%s", g_paused?"ON":"OFF"); if(InpUsePersistence) SaveState(); }
    else if(sparam == BTN_LOCK)       { Print("BTN: Lock Now");     ForceLockNow(); }
    else if(sparam == BTN_RESET)      { Print("BTN: Reset Stop");   g_emergencyStop = false; if(InpUsePersistence) SaveState(); }
+   else if(sparam == BTN_MANUAL_BUY) { Print("BTN: Manual BUY");   DoManualOpen(ORDER_TYPE_BUY); }
+   else if(sparam == BTN_MANUAL_SELL){ Print("BTN: Manual SELL");  DoManualOpen(ORDER_TYPE_SELL); }
 
    ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
    ChartRedraw(0);
@@ -557,6 +571,56 @@ void ForceLockNow()
    if(lot <= 0) return;
    if(net > 0) OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "MANUAL-LOCK");
    else        OpenPosition(_Symbol, ORDER_TYPE_BUY,  lot, "MANUAL-LOCK");
+  }
+
+//+------------------------------------------------------------------+
+//| Manual market order from panel button                            |
+//|   Used in Strategy Tester (visual mode) and on live charts to    |
+//|   open a position by hand. EA picks it up automatically because  |
+//|   the magic equals InpMagic. After that all standard recovery    |
+//|   logic applies: targets, virtual SL/TP/TSL, basket trailing,    |
+//|   averaging/martingale, hedge-lock with auto-unwind, etc.        |
+//+------------------------------------------------------------------+
+void DoManualOpen(const ENUM_ORDER_TYPE side)
+  {
+   if(InpSymbolScope != SCOPE_CURRENT)
+     {
+      Print("Manual open: requires SCOPE_CURRENT (manage scope = current symbol)");
+      Notify("Manual open: SCOPE_CURRENT required");
+      return;
+     }
+   if(g_emergencyStop)
+     {
+      Print("Manual open blocked: emergency stop is active. Press 'Reset Stop' first.");
+      Notify("Manual open blocked: EMERGENCY STOP");
+      return;
+     }
+   if(!SpreadOK(_Symbol))
+     {
+      PrintFormat("Manual open blocked: spread > InpMaxSpreadPts=%.0f", InpMaxSpreadPts);
+      Notify("Manual open blocked: spread too wide");
+      return;
+     }
+   if(InpManualLot <= 0)
+     {
+      Print("Manual open: InpManualLot must be > 0");
+      Notify("Manual open: InpManualLot <= 0");
+      return;
+     }
+   double lot = NormalizeLot(_Symbol, InpManualLot);
+   if(lot <= 0)
+     {
+      PrintFormat("Manual open: NormalizeLot(%.2f) -> 0 (check broker min/max/step)", InpManualLot);
+      Notify("Manual open: lot normalized to 0");
+      return;
+     }
+   string tag = (side == ORDER_TYPE_BUY) ? "MANUAL-BUY" : "MANUAL-SELL";
+   if(OpenPosition(_Symbol, side, lot, tag))
+     {
+      PrintFormat("Manual %s opened: lot=%.2f", (side==ORDER_TYPE_BUY?"BUY":"SELL"), lot);
+      Notify(StringFormat("Manual %s %.2f opened on %s",
+                          (side==ORDER_TYPE_BUY?"BUY":"SELL"), lot, _Symbol));
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1111,6 +1175,14 @@ void CreatePanel()
    CreateButton(BTN_CLOSE_SELL, 10+bw+gap,     btnY+bh+gap,      bw, bh, "Close SELL", clrIndianRed, clrWhite);
    CreateButton(BTN_LOCK,       10,            btnY+2*(bh+gap),  bw, bh, "Lock Now",   clrGoldenrod, clrBlack);
    CreateButton(BTN_RESET,      10+bw+gap,     btnY+2*(bh+gap),  bw, bh, "Reset Stop", clrDarkGreen, clrWhite);
+   if(InpShowManualButtons)
+     {
+      // Lot label above the manual row
+      CreateLabel("manualLot", 10, btnY+3*(bh+gap)+2);
+      // Manual market open buttons
+      CreateButton(BTN_MANUAL_BUY,  10,        btnY+4*(bh+gap), bw, bh, "BUY (manual)",  clrTeal,      clrWhite);
+      CreateButton(BTN_MANUAL_SELL, 10+bw+gap, btnY+4*(bh+gap), bw, bh, "SELL (manual)", clrDarkOrange, clrWhite);
+     }
   }
 
 void SetLabel(const string key, const string text, color clr = clrNONE)
@@ -1144,7 +1216,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.30 ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.31 ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -1205,6 +1277,8 @@ void UpdatePanel(const BasketState &bs)
    SetLabel("stop", statusText, statusClr);
 
    ObjectSetString(0, BTN_PAUSE, OBJPROP_TEXT, g_paused ? "Resume" : "Pause");
+   if(InpShowManualButtons)
+      SetLabel("manualLot", StringFormat("Manual lot: %.2f", InpManualLot), clrLightGray);
    ChartRedraw(0);
   }
 //+------------------------------------------------------------------+
