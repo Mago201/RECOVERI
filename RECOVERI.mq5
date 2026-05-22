@@ -1,7 +1,29 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.42                                                           |
+//|  v1.43                                                           |
+//|  Добавлено в v1.43 (фиксы режима 5 — Partial Recovery):          |
+//|    - Net-positive guard на партиал-закрытии: при срабатывании TP |
+//|      усреднителя (PR-AVG) теперь ЧИП от убыточной позиции        |
+//|      рассчитывается динамически так, чтобы сумма (профит         |
+//|      усреднителя + убыток откушенного куска лока/убыточника)     |
+//|      была >= InpMinNetProfit. Раньше чип был фиксированный       |
+//|      InpPartCloseLot, и при глубоком минусе цикл «закрыть TP +   |
+//|      откусить часть» уходил в минус. Теперь либо чип             |
+//|      уменьшается до безопасного объёма (≥ minLot брокера), либо  |
+//|      чип пропускается и усреднитель просто фиксирует свой        |
+//|      профит. Управляется ключом InpEnsureNetPositive (по         |
+//|      умолчанию true). Старое поведение возвращается              |
+//|      InpEnsureNetPositive=false.                                 |
+//|    - Перезапуск сетки на смене тренда: если включён              |
+//|      InpUseTrendFilter и тренд (быстрая/медленная MA на старшем  |
+//|      ТФ) переворачивается, советник сбрасывает счётчик           |
+//|      усреднителей g_prAvgCount* и one-per-bar-gate на той        |
+//|      стороне, куда теперь идёт тренд, чтобы новая цепочка        |
+//|      усреднителей открылась немедленно (мультипликатор объёма    |
+//|      и шага начнётся с нуля), не дожидаясь шага от последнего    |
+//|      «старого» усреднителя. Управляется InpRestartGridOnTrendFlip|
+//|      (по умолчанию true).                                        |
 //|  Добавлено в v1.42:                                              |
 //|    - Фикс: кнопки панели (BUY/SELL manual, Close All и др.) не   |
 //|      реагировали в Strategy Tester. В MT5 визуальном тестере     |
@@ -60,9 +82,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.42"
+#property version   "1.43"
 #property strict
-#property description "Universal MT5 Recovery EA v1.42 - basket + partial recovery + tester-buttons polling"
+#property description "Universal MT5 Recovery EA v1.43 - Mode5 net-positive partial close + grid restart on trend flip"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -234,6 +256,9 @@ input bool               InpPRBidirectional  = false;                // Откр
 input int                InpOverlapAfterN    = 0;                    // Closing overlap: 0=off, N=>после N оставлять только first+last
 input ENUM_RECOVERY_PRIORITY InpRecoveryPriority = PRIO_HARD;        // Приоритет: какие убыточные ордера обрабатывать первыми
 input ulong              InpFirstTicket      = 0;                    // Конкретный тикет первым (0=не использовать)
+input bool               InpEnsureNetPositive = true;                // Mode5: гарантировать неотрицательный итог пары (TP усреднителя + чип убыточника)
+input double             InpMinNetProfit      = 0.0;                 // Mode5: минимальный итог пары в валюте депо (>=0)
+input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
 
 input group "=== Тренд-фильтр для усреднителей ==="
 input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
@@ -351,6 +376,7 @@ datetime      g_prLastBarTime = 0;         // for one-per-bar averagers (BUY sid
 datetime      g_prLastBarTimeS= 0;         // for one-per-bar averagers (SELL side)
 int           g_prAvgCountBuy = 0;
 int           g_prAvgCountSell= 0;
+int           g_prLastTrend   = 0;         // last seen trend direction (-1/0/+1) for flip detection
 
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
@@ -393,6 +419,8 @@ int OnInit()
         { Print("InpMaxAveragers must be > 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpUseTrendFilter && (InpTrendFastMA <= 0 || InpTrendSlowMA <= 0 || InpTrendFastMA >= InpTrendSlowMA))
         { Print("Trend filter MA periods invalid (need 0<fast<slow)"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpMinNetProfit < 0)
+        { Print("InpMinNetProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
      }
 
    if(InpMode == MODE_HEDGE_LOCK)
@@ -458,7 +486,7 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.42 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.43 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
    return INIT_SUCCEEDED;
@@ -1653,6 +1681,26 @@ void DoPartialRecovery(const BasketState &bs)
 
    int trend = TrendDirection();  // +1 / -1 / 0(filter off or neutral)
 
+   //--- Trend reversal: restart grid counters on the new side -----------
+   // When trend flips (e.g. from -1 to +1) we want a fresh averager chain
+   // on the trend side: the volume/step multiplier resets and the one-per-
+   // bar gate re-arms so a new averager can open immediately.  Existing
+   // averagers on the old side keep running and will close on TP / overlap.
+   if(InpRestartGridOnTrendFlip && trend != 0
+      && g_prLastTrend != 0 && trend != g_prLastTrend)
+     {
+      PrintFormat("PR: trend flip %d -> %d, restart grid on %s side",
+                  g_prLastTrend, trend, (trend > 0 ? "BUY" : "SELL"));
+      Notify(StringFormat("PR: trend reversal -> restart grid (%s)",
+                          trend > 0 ? "BUY" : "SELL"));
+      if(trend > 0)
+        { g_prAvgCountBuy  = 0; g_prLastBarTime  = 0; }
+      else
+        { g_prAvgCountSell = 0; g_prLastBarTimeS = 0; }
+      if(InpUsePersistence) SaveState();
+     }
+   if(trend != 0) g_prLastTrend = trend;
+
    // BUY averager (covers SELL losing baskets if non-bidirectional)
    bool wantBuy  = false;
    bool wantSell = false;
@@ -1735,8 +1783,15 @@ double LastAveragerPrice(const ENUM_POSITION_TYPE side, const string tag)
   }
 
 //+------------------------------------------------------------------+
-//| For each profitable averager: close it, then chip InpPartCloseLot |
-//| off the worst losing position on the OPPOSITE side.               |
+//| For each profitable averager: close it, then chip a SAFE amount   |
+//| off the worst losing position on the OPPOSITE side, sized so the  |
+//| combined cycle PnL (averager profit + chip realized loss) stays   |
+//| >= InpMinNetProfit.                                                |
+//|                                                                   |
+//| If even the broker's minLot would drag the cycle below the floor, |
+//| the chip is skipped entirely and the averager profit is locked in |
+//| on its own.  Set InpEnsureNetPositive=false to fall back to the   |
+//| legacy fixed-lot chipping (InpPartCloseLot every cycle).           |
 //+------------------------------------------------------------------+
 void ProcessProfitableAveragers(const BasketState &bs)
   {
@@ -1760,33 +1815,96 @@ void ProcessProfitableAveragers(const BasketState &bs)
       int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = t;
      }
 
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+
    for(int i = 0; i < ArraySize(tickets); i++)
      {
       if(!pos.SelectByTicket(tickets[i])) continue;
       ENUM_POSITION_TYPE avgSide = pos.PositionType();
-      double avgVol = pos.Volume();
+      double avgVol    = pos.Volume();
+      double avgProfit = pos.Profit() + pos.Swap() + pos.Commission();
 
-      // Close the averager
-      if(!trade.PositionClose(tickets[i], (ulong)InpSlippage)) continue;
-      PrintFormat("PR: closed averager #%I64u (%s %.2f)", tickets[i],
-                  avgSide==POSITION_TYPE_BUY?"BUY":"SELL", avgVol);
-      if(avgSide == POSITION_TYPE_BUY) g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy-1);
-      else                              g_prAvgCountSell = MathMax(0, g_prAvgCountSell-1);
-
-      // Chip a part off the worst losing position on the OPPOSITE side
+      // --- Pick a losing target on the OPPOSITE side first ------------
       ENUM_POSITION_TYPE losingSide = (avgSide == POSITION_TYPE_BUY)
                                        ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
       ulong target = PickLosingTicket(losingSide);
-      if(target == 0)
+      if(target == 0) target = PickLosingTicket(avgSide);
+
+      // --- Compute a safe chip lot that keeps net >= InpMinNetProfit --
+      double safeChip = 0.0;
+      bool   willChip = false;
+      string skipReason = "";
+
+      if(target != 0 && pos.SelectByTicket(target))
         {
-         // Try same side (case where averager was opened against the bigger loss)
-         target = PickLosingTicket(avgSide);
+         double tgtVol = pos.Volume();
+         double tgtPnL = pos.Profit() + pos.Swap() + pos.Commission(); // expected <0
+
+         if(tgtVol <= 0 || tgtPnL >= 0)
+           {
+            skipReason = "target not in loss";
+           }
+         else if(InpEnsureNetPositive)
+           {
+            double pnlPerLot = tgtPnL / tgtVol;        // <0 ($/lot)
+            double headroom  = avgProfit - InpMinNetProfit;
+            if(headroom <= 0)
+              {
+               skipReason = StringFormat("avgProfit %.2f <= floor %.2f",
+                                         avgProfit, InpMinNetProfit);
+              }
+            else
+              {
+               double maxChip = headroom / MathAbs(pnlPerLot);
+               safeChip = MathMin(InpPartCloseLot, maxChip);
+               // round DOWN to broker step
+               safeChip = MathFloor(safeChip / step + 1e-9) * step;
+               if(safeChip + 1e-9 < minLot)
+                 {
+                  skipReason = StringFormat("safeChip %.4f < minLot %.4f (per-lot loss %.2f)",
+                                            safeChip, minLot, pnlPerLot);
+                  safeChip = 0.0;
+                 }
+               else
+                 {
+                  willChip = true;
+                 }
+              }
+           }
+         else
+           {
+            // legacy: fixed chip
+            safeChip = InpPartCloseLot;
+            willChip = true;
+           }
         }
-      if(target != 0)
+
+      // --- Re-select the averager and close it ------------------------
+      if(!pos.SelectByTicket(tickets[i])) continue;
+      if(!trade.PositionClose(tickets[i], (ulong)InpSlippage)) continue;
+
+      PrintFormat("PR: closed averager #%I64u (%s %.2f, profit=%.2f)",
+                  tickets[i],
+                  avgSide==POSITION_TYPE_BUY?"BUY":"SELL", avgVol, avgProfit);
+      if(avgSide == POSITION_TYPE_BUY) g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy-1);
+      else                              g_prAvgCountSell = MathMax(0, g_prAvgCountSell-1);
+
+      // --- Chip the loser if safe; otherwise just lock the avg profit -
+      if(willChip && target != 0)
         {
-         if(ClosePartOfPosition(target, InpPartCloseLot))
-            PrintFormat("PR: chipped %.2f from loser #%I64u (priority=%d)",
-                        InpPartCloseLot, target, (int)InpRecoveryPriority);
+         if(ClosePartOfPosition(target, safeChip))
+           {
+            PrintFormat("PR: chipped %.4f from #%I64u (avgP=%.2f, prio=%d, mode=%s)",
+                        safeChip, target, avgProfit, (int)InpRecoveryPriority,
+                        InpEnsureNetPositive ? "net+" : "fixed");
+           }
+        }
+      else if(target != 0)
+        {
+         PrintFormat("PR: chip skipped on #%I64u — %s; averager profit %.2f locked.",
+                     target, skipReason, avgProfit);
         }
       else
         {
@@ -1922,7 +2040,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.42 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.43 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -2274,6 +2392,7 @@ void DoResetState()
    g_prAvgCountSell    = 0;
    g_prLastBarTime     = 0;
    g_prLastBarTimeS    = 0;
+   g_prLastTrend       = 0;
    g_recoveryTriggered = false;
    g_otherEAsDisabled  = false;
    g_peakProfit        = 0.0;
