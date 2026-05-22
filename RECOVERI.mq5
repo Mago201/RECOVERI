@@ -1,7 +1,15 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.41                                                           |
+//|  v1.42                                                           |
+//|  Добавлено в v1.42:                                              |
+//|    - Фикс: кнопки панели (BUY/SELL manual, Close All и др.) не   |
+//|      реагировали в Strategy Tester. В MT5 визуальном тестере     |
+//|      OnChartEvent доставляет CHARTEVENT_OBJECT_CLICK ненадёжно.  |
+//|      Добавлен PollPanelButtons() — опрос OBJPROP_STATE кнопок    |
+//|      каждый тик; если кнопка нажата, диспетчеризуем обработчик   |
+//|      через общий HandlePanelClick(). Активно ТОЛЬКО в тестере    |
+//|      (MQL_TESTER=true), в live торговле поведение неизменно.    |
 //|  Добавлено в v1.41:                                              |
 //|    - Защита persistence-state от «застревания» между сменами     |
 //|      режимов: в GV сохраняется отметка MODE; при несовпадении    |
@@ -52,9 +60,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.41"
+#property version   "1.42"
 #property strict
-#property description "Universal MT5 Recovery EA v1.41 - basket + partial recovery + state-mode guard"
+#property description "Universal MT5 Recovery EA v1.42 - basket + partial recovery + tester-buttons polling"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -450,7 +458,7 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.41 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.42 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
    return INIT_SUCCEEDED;
@@ -475,6 +483,11 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   // Strategy Tester workaround: OnChartEvent is unreliable in Visual mode,
+   // so poll panel buttons every tick and dispatch their handlers manually.
+   // No-op outside the tester.
+   PollPanelButtons();
+
    // Self-disable signal from a sibling RECOVERI instance
    if(InpDisableOtherEAs == DISABLE_NONE && CheckSelfDisableSignal())
      {
@@ -533,10 +546,11 @@ void OnTick()
   }
 
 //+------------------------------------------------------------------+
-void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+//| Dispatch a single button click. Used by both OnChartEvent (live) |
+//| and PollPanelButtons() (Strategy Tester Visual mode workaround). |
+//+------------------------------------------------------------------+
+void HandlePanelClick(const string sparam)
   {
-   if(id != CHARTEVENT_OBJECT_CLICK) return;
-
    if(sparam == BTN_CLOSE_ALL)       { Print("BTN: Close All");    CloseAllManaged(); }
    else if(sparam == BTN_CLOSE_BUY)  { Print("BTN: Close BUY");    CloseSide(POSITION_TYPE_BUY); }
    else if(sparam == BTN_CLOSE_SELL) { Print("BTN: Close SELL");   CloseSide(POSITION_TYPE_SELL); }
@@ -546,9 +560,46 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    else if(sparam == BTN_RESET_STATE){ Print("BTN: Reset State");  DoResetState(); }
    else if(sparam == BTN_MANUAL_BUY) { Print("BTN: Manual BUY");   DoManualOpen(ORDER_TYPE_BUY); }
    else if(sparam == BTN_MANUAL_SELL){ Print("BTN: Manual SELL");  DoManualOpen(ORDER_TYPE_SELL); }
+   else return;
 
    ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
    ChartRedraw(0);
+  }
+
+//+------------------------------------------------------------------+
+//| Strategy Tester (Visual mode) workaround:                        |
+//|   in MT5 Strategy Tester CHARTEVENT_OBJECT_CLICK is delivered    |
+//|   to OnChartEvent unreliably (depends on terminal build). To     |
+//|   make panel buttons usable for manual BUY/SELL during a visual  |
+//|   tester run, on each tick we poll OBJPROP_STATE of every panel  |
+//|   button and dispatch the same handler if it is "pressed".       |
+//|   No-op outside the tester.                                      |
+//+------------------------------------------------------------------+
+void PollPanelButtons()
+  {
+   if(!MQLInfoInteger(MQL_TESTER)) return;   // live: rely on OnChartEvent
+   if(!InpShowPanel) return;
+
+   static const string buttons[] =
+     {
+      BTN_CLOSE_ALL, BTN_CLOSE_BUY, BTN_CLOSE_SELL,
+      BTN_PAUSE, BTN_LOCK, BTN_RESET, BTN_RESET_STATE,
+      BTN_MANUAL_BUY, BTN_MANUAL_SELL
+     };
+   for(int i=0; i<ArraySize(buttons); i++)
+     {
+      const string name = buttons[i];
+      if(ObjectFind(0, name) < 0) continue;
+      if(ObjectGetInteger(0, name, OBJPROP_STATE) != 0)
+         HandlePanelClick(name);
+     }
+  }
+
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+  {
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+   HandlePanelClick(sparam);
   }
 
 //+------------------------------------------------------------------+
@@ -1871,7 +1922,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.41 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.42 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
