@@ -1,8 +1,29 @@
-//+------------------------------------------------------------------+
+﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.30                                                           |
-//|  Добавлено в v1.30:                                              |
+//|  v1.40                                                           |
+//|  Добавлено в v1.40 ("ULTIMATE"):                                 |
+//|    - Режим MODE_PARTIAL_RECOVERY: лок + усреднители +            |
+//|      ДРОБНОЕ закрытие убыточной позиции (a la AW Recovery).      |
+//|      Каждый прибыльный усреднитель закрывает не только себя, но  |
+//|      и кусок самого убыточного ордера через PositionClosePartial.|
+//|    - Standby-mode: советник стартует только при достижении       |
+//|      просадки (Instant / % / $) — InpStartTrigger.               |
+//|    - Тренд-фильтр для усреднителей (быстрая/медленная MA на      |
+//|      старшем ТФ) — InpUseTrendFilter.                            |
+//|    - One-Per-Bar: не более одного усреднителя на свечу.          |
+//|    - Closing overlap: в длинной цепочке усреднителей закрывается |
+//|      только первый+последний (InpOverlapAfterN).                 |
+//|    - Приоритет обработки в SmartClose/PartialRecovery:           |
+//|      EASY / HARD / FIRST_TICKET.                                 |
+//|    - Email-уведомления (SendMail) дополнительно к Alert/Push.    |
+//|    - Disable other EAs at launch — снять чужие советники с       |
+//|      символа или со всех символов (опционально).                 |
+//|  v1.31:                                                          |
+//|    - Кнопки ручного открытия BUY/SELL на панели                  |
+//|      (для теста стратегии в визуальном режиме и на лайве)        |
+//|    - Все input-параметры переведены на русский                   |
+//|  v1.30:                                                          |
 //|    - Авто-распил (раскулачивание) лока в режиме HedgeLock        |
 //|      Фазы: IDLE -> LOCKED -> UNWOUND -> (RELOCKED) -> ...        |
 //|      Закрытие выгодной ноги по цели/трейлингу                    |
@@ -21,9 +42,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.30"
+#property version   "1.40"
 #property strict
-#property description "Universal MT5 Recovery EA - basket recovery from drawdown"
+#property description "Universal MT5 Recovery EA v1.40 - basket + partial recovery"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -33,159 +54,225 @@
 //=== Enums ==========================================================
 enum ENUM_RECOVERY_MODE
   {
-   MODE_TARGET_PROFIT = 0,    // 0: TargetProfit
-   MODE_AVERAGING     = 1,    // 1: Averaging
-   MODE_MARTINGALE    = 2,    // 2: Martingale grid
-   MODE_HEDGE_LOCK    = 3,    // 3: HedgeLock
-   MODE_SMART_CLOSE   = 4     // 4: SmartClose
+   MODE_TARGET_PROFIT     = 0,    // 0: Только закрытие по цели
+   MODE_AVERAGING         = 1,    // 1: Усреднение
+   MODE_MARTINGALE        = 2,    // 2: Мартингейл-сетка
+   MODE_HEDGE_LOCK        = 3,    // 3: Хедж-лок
+   MODE_SMART_CLOSE       = 4,    // 4: Парное закрытие (SmartClose)
+   MODE_PARTIAL_RECOVERY  = 5     // 5: Дробное восстановление (a la AW Recovery)
   };
 
 enum ENUM_MANAGE_SCOPE
   {
-   MANAGE_ALL    = 0,         // 0: All positions
-   MANAGE_MANUAL = 1,         // 1: Manual only (magic==0)
-   MANAGE_OWN    = 2          // 2: Own only (by InpMagic)
+   MANAGE_ALL    = 0,         // 0: Все позиции
+   MANAGE_MANUAL = 1,         // 1: Только ручные (magic==0)
+   MANAGE_OWN    = 2          // 2: Только свои (по InpMagic)
   };
 
 enum ENUM_SYMBOL_SCOPE
   {
-   SCOPE_CURRENT = 0,         // 0: Current symbol
-   SCOPE_ALL     = 1          // 1: All symbols
+   SCOPE_CURRENT = 0,         // 0: Текущий символ
+   SCOPE_ALL     = 1          // 1: Все символы
   };
 
 enum ENUM_TARGET_TYPE
   {
-   TARGET_MONEY   = 0,        // 0: Money
-   TARGET_PERCENT = 1,        // 1: Percent of balance
-   TARGET_PIPS    = 2         // 2: Pips equivalent
+   TARGET_MONEY   = 0,        // 0: Деньги (валюта депо)
+   TARGET_PERCENT = 1,        // 1: % от баланса
+   TARGET_PIPS    = 2         // 2: Эквивалент в пунктах
   };
 
 
 enum ENUM_BASKET_MODE
   {
-   BASKET_COMBINED = 0,       // 0: Combined BUY+SELL basket
-   BASKET_PER_SIDE = 1        // 1: Separate BUY and SELL baskets
+   BASKET_COMBINED = 0,       // 0: Общая корзина BUY+SELL
+   BASKET_PER_SIDE = 1        // 1: Раздельные корзины BUY и SELL
   };
 
 enum ENUM_GRID_SIDE
   {
-   GRID_BOTH = 0,             // 0: Both sides (BUY_LIMIT below + SELL_LIMIT above)
-   GRID_BUY  = 1,             // 1: BUY_LIMIT only (below market)
-   GRID_SELL = 2              // 2: SELL_LIMIT only (above market)
+   GRID_BOTH = 0,             // 0: Обе стороны (BUY_LIMIT + SELL_LIMIT)
+   GRID_BUY  = 1,             // 1: Только BUY_LIMIT (ниже рынка)
+   GRID_SELL = 2              // 2: Только SELL_LIMIT (выше рынка)
   };
 
 enum ENUM_LOCK_PHASE
   {
-   PHASE_IDLE     = 0,        // 0: no lock
-   PHASE_LOCKED   = 1,        // 1: both sides open (locked)
-   PHASE_UNWOUND  = 2,        // 2: one side closed, managing remaining side
-   PHASE_RELOCKED = 3         // 3: counter-lock opened on top of remaining side
+   PHASE_IDLE     = 0,        // 0: лока нет
+   PHASE_LOCKED   = 1,        // 1: обе стороны открыты (лок)
+   PHASE_UNWOUND  = 2,        // 2: одна нога закрыта, ведём оставшуюся
+   PHASE_RELOCKED = 3         // 3: переоткрыт встречный лок поверх остатка
+  };
+
+enum ENUM_START_TRIGGER
+  {
+   START_INSTANT       = 0,   // 0: Запуск сразу
+   START_DD_PERCENT    = 1,   // 1: По просадке в % от баланса
+   START_DD_MONEY      = 2    // 2: По просадке в валюте депо
+  };
+
+enum ENUM_RECOVERY_PRIORITY
+  {
+   PRIO_EASY           = 0,   // 0: Сначала самые лёгкие (минимальный убыток)
+   PRIO_HARD           = 1,   // 1: Сначала самые тяжёлые (максимальный убыток)
+   PRIO_FIRST_TICKET   = 2    // 2: Конкретный тикет первым
+  };
+
+enum ENUM_PR_PHASE
+  {
+   PR_IDLE       = 0,         // 0: ожидание триггера
+   PR_LOCKING    = 1,         // 1: выравнивание объёмов в лок
+   PR_RECOVERING = 2,         // 2: распил усреднителями + partial close
+   PR_DONE       = 3          // 3: восстановление завершено
+  };
+
+enum ENUM_DISABLE_EAS
+  {
+   DISABLE_NONE        = 0,   // 0: Не выключать другие советники
+   DISABLE_SAME_SYMBOL = 1,   // 1: Выключить советники на этом символе
+   DISABLE_ALL_SYMBOLS = 2    // 2: Выключить советники на всех символах
   };
 
 //=== Inputs =========================================================
 input group "=== Общие ==="
-input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;
-input ENUM_MANAGE_SCOPE  InpManageScope   = MANAGE_ALL;
-input ENUM_SYMBOL_SCOPE  InpSymbolScope   = SCOPE_CURRENT;
-input long               InpMagic         = 20260520;
-input string             InpComment       = "RECOVERI";
-input int                InpSlippage      = 30;
-input double             InpMaxSpreadPts  = 0;
+input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;  // Режим восстановления
+input ENUM_MANAGE_SCOPE  InpManageScope   = MANAGE_ALL;          // Какие позиции брать в управление
+input ENUM_SYMBOL_SCOPE  InpSymbolScope   = SCOPE_CURRENT;       // Область по символу
+input long               InpMagic         = 20260520;            // Magic number советника
+input string             InpComment       = "RECOVERI";          // Комментарий к ордерам
+input int                InpSlippage      = 30;                  // Допустимое проскальзывание (пункты)
+input double             InpMaxSpreadPts  = 0;                   // Макс. спред (пункты, 0 = не проверять)
 
 input group "=== Корзина и цель ==="
-input ENUM_BASKET_MODE   InpBasketMode    = BASKET_COMBINED;
-input ENUM_TARGET_TYPE   InpTargetType    = TARGET_MONEY;
-input double             InpTargetProfit  = 10.0;
-input bool               InpUseBasketTSL  = false;
-input double             InpBasketTSLStart= 20.0;
-input double             InpBasketTSLStep = 5.0;
+input ENUM_BASKET_MODE   InpBasketMode    = BASKET_COMBINED;     // Режим корзины
+input ENUM_TARGET_TYPE   InpTargetType    = TARGET_MONEY;        // Тип цели
+input double             InpTargetProfit  = 10.0;                // Значение цели
+input bool               InpUseBasketTSL  = false;               // Включить трейлинг корзины
+input double             InpBasketTSLStart= 20.0;                // Старт трейлинга (профит корзины)
+input double             InpBasketTSLStep = 5.0;                 // Откат от пика для закрытия
 
 input group "=== Виртуальные TP/SL ==="
-input bool               InpUseVirtualTP  = false;
-input int                InpVirtualTPPts  = 200;
-input bool               InpUseVirtualSL  = false;
-input int                InpVirtualSLPts  = 1000;
-input bool               InpUseVirtualBE  = false;
-input int                InpVirtualBEPts  = 100;
+input bool               InpUseVirtualTP  = false;               // Включить виртуальный TP
+input int                InpVirtualTPPts  = 200;                 // Виртуальный TP (пункты)
+input bool               InpUseVirtualSL  = false;               // Включить виртуальный SL
+input int                InpVirtualSLPts  = 1000;                // Виртуальный SL (пункты)
+input bool               InpUseVirtualBE  = false;               // Включить виртуальный безубыток
+input int                InpVirtualBEPts  = 100;                 // Триггер безубытка (пункты)
 
 input group "=== Виртуальный трейлинг-стоп (по каждой позиции) ==="
-input bool               InpUseVirtualTSL  = false;
-input int                InpVirtualTSLStartPts = 200;  // профит для активации трейлинга (пункты)
-input int                InpVirtualTSLDistPts  = 100;  // расстояние трейлинга от пика (пункты)
+input bool               InpUseVirtualTSL  = false;              // Включить трейлинг по позициям
+input int                InpVirtualTSLStartPts = 200;            // Профит для активации трейлинга (пункты)
+input int                InpVirtualTSLDistPts  = 100;            // Расстояние трейлинга от пика (пункты)
 
 input group "=== Стратегии (Averaging/Martingale) ==="
-input double             InpStartLot      = 0.01;
-input double             InpLotMultiplier = 1.5;
-input double             InpLotAdd        = 0.0;
-input int                InpStepPoints    = 300;
-input double             InpStepMultiplier= 1.2;
-input int                InpMaxTrades     = 10;
-input double             InpMaxLot        = 1.0;
+input double             InpStartLot      = 0.01;                // Стартовый лот
+input double             InpLotMultiplier = 1.5;                 // Множитель лота (мартингейл)
+input double             InpLotAdd        = 0.0;                 // Прибавка к лоту (усреднение, 0 = не использовать)
+input int                InpStepPoints    = 300;                 // Базовый шаг сетки (пункты)
+input double             InpStepMultiplier= 1.2;                 // Множитель шага сетки
+input int                InpMaxTrades     = 10;                  // Макс. позиций в корзине
+input double             InpMaxLot        = 1.0;                 // Лимит лота на одну позицию
 
 input group "=== HedgeLock ==="
-input double             InpLockTriggerLoss= 50.0;
-input double             InpLockLotFactor = 1.0;
+input double             InpLockTriggerLoss= 50.0;               // Убыток корзины для открытия лока (валюта депо)
+input double             InpLockLotFactor = 1.0;                 // Доля чистого объёма для лока (1.0 = 100%)
 
 
 input group "=== Авто-распил лока (Mode 3) ==="
-input bool               InpAutoUnlock          = false;   // включить авто-распил после лока
-input double             InpUnlockProfitUSD     = 30.0;    // профит ОДНОЙ ноги для её закрытия (в валюте депо)
-input bool               InpUseSideTSL          = true;    // трейлинг профита ноги при распиле
-input double             InpUnlockTSLStart      = 50.0;    // пик профита ноги для активации TSL
-input double             InpUnlockTSLStep       = 20.0;    // откат от пика для закрытия ноги
-input bool               InpEnableRelock        = false;   // переоткрывать частичный встречный лок при провале
-input double             InpRelockTriggerLoss   = 80.0;    // убыток на оставшейся ноге для перелока (в валюте депо)
-input double             InpRelockLotFactor     = 0.5;     // доля объёма оставшейся ноги для перелока (0..1)
-input int                InpMaxRelocks          = 2;       // максимум последовательных перелоков
+input bool               InpAutoUnlock          = false;   // Включить авто-распил после лока
+input double             InpUnlockProfitUSD     = 30.0;    // Профит ОДНОЙ ноги для её закрытия (валюта депо)
+input bool               InpUseSideTSL          = true;    // Трейлинг профита ноги при распиле
+input double             InpUnlockTSLStart      = 50.0;    // Пик профита ноги для активации TSL
+input double             InpUnlockTSLStep       = 20.0;    // Откат от пика для закрытия ноги
+input bool               InpEnableRelock        = false;   // Переоткрывать частичный встречный лок при провале
+input double             InpRelockTriggerLoss   = 80.0;    // Убыток на оставшейся ноге для перелока (валюта депо)
+input double             InpRelockLotFactor     = 0.5;     // Доля объёма оставшейся ноги для перелока (0..1]
+input int                InpMaxRelocks          = 2;       // Максимум последовательных перелоков
 
+
+input group "=== Standby-режим (старт по триггеру) ==="
+input ENUM_START_TRIGGER InpStartTrigger     = START_INSTANT;        // Триггер запуска
+input double             InpStartThreshold   = 100.0;                // Порог: % просадки или сумма ($)
+input bool               InpAutoResetAfterDone = false;              // Автосброс триггера после восстановления
+
+input group "=== Partial Recovery (Mode 5) ==="
+input double             InpPartCloseLot     = 0.10;                 // Размер части убыточной позиции для закрытия (лот)
+input double             InpAvgVolume        = 0.15;                 // Объём первого усреднителя (≈ Part * 1.5)
+input double             InpAvgVolumeMul     = 1.0;                  // Множитель объёма усреднителей (>=1)
+input int                InpAvgStepPts       = 250;                  // Шаг сетки усреднителей (пункты)
+input double             InpAvgStepMul       = 1.2;                  // Множитель шага усреднителей
+input int                InpAvgTPpts         = 30;                   // TP усреднителя (пункты, должен > 3*spread)
+input int                InpMaxAveragers     = 15;                   // Макс. число одновременных усреднителей
+input bool               InpPRBidirectional  = false;                // Открывать усреднители в обе стороны
+input int                InpOverlapAfterN    = 0;                    // Closing overlap: 0=off, N=>после N оставлять только first+last
+input ENUM_RECOVERY_PRIORITY InpRecoveryPriority = PRIO_HARD;        // Приоритет: какие убыточные ордера обрабатывать первыми
+input ulong              InpFirstTicket      = 0;                    // Конкретный тикет первым (0=не использовать)
+
+input group "=== Тренд-фильтр для усреднителей ==="
+input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
+input ENUM_TIMEFRAMES    InpTrendTF          = PERIOD_H1;            // Таймфрейм для тренд-фильтра
+input int                InpTrendFastMA      = 21;                   // Период быстрой MA
+input int                InpTrendSlowMA      = 50;                   // Период медленной MA
+input bool               InpOneOrderPerBar   = false;                // Не более одного усреднителя на свечу
+
+input group "=== Отключение чужих советников ==="
+input ENUM_DISABLE_EAS   InpDisableOtherEAs  = DISABLE_NONE;         // Снять других ботов при старте recovery
 
 input group "=== Защита счёта ==="
-input bool               InpUseEquityStop = false;
-input double             InpEquityStopPct = 50.0;
-input bool               InpCloseOnly     = false;
+input bool               InpUseEquityStop = false;               // Включить аварийный equity-стоп
+input double             InpEquityStopPct = 50.0;                // Порог equity (% от баланса)
+input bool               InpCloseOnly     = false;               // Только закрытие (новые сделки не открывать)
 
 input group "=== Фильтр времени ==="
-input bool               InpUseTimeFilter = false;
-input int                InpStartHour     = 0;
-input int                InpEndHour       = 24;
-input bool               InpTradeMon      = true;
-input bool               InpTradeTue      = true;
-input bool               InpTradeWed      = true;
-input bool               InpTradeThu      = true;
-input bool               InpTradeFri      = true;
-input bool               InpTradeSat      = false;
-input bool               InpTradeSun      = false;
+input bool               InpUseTimeFilter = false;               // Включить фильтр времени
+input int                InpStartHour     = 0;                   // Начало торгового окна (час 0..24)
+input int                InpEndHour       = 24;                  // Конец торгового окна (час 0..24)
+input bool               InpTradeMon      = true;                // Понедельник
+input bool               InpTradeTue      = true;                // Вторник
+input bool               InpTradeWed      = true;                // Среда
+input bool               InpTradeThu      = true;                // Четверг
+input bool               InpTradeFri      = true;                // Пятница
+input bool               InpTradeSat      = false;               // Суббота
+input bool               InpTradeSun      = false;               // Воскресенье
 
 input group "=== Новостной фильтр (MT5 Calendar) ==="
-input bool               InpUseNewsFilter = false;
-input bool               InpNewsHigh      = true;
-input bool               InpNewsMedium    = false;
-input bool               InpNewsLow       = false;
-input int                InpNewsMinsBefore= 30;
-input int                InpNewsMinsAfter = 30;
+input bool               InpUseNewsFilter = false;               // Включить новостной фильтр
+input bool               InpNewsHigh      = true;                // Блокировать события High
+input bool               InpNewsMedium    = false;               // Блокировать события Medium
+input bool               InpNewsLow       = false;               // Блокировать события Low
+input int                InpNewsMinsBefore= 30;                  // Минут до события
+input int                InpNewsMinsAfter = 30;                  // Минут после события
 
 input group "=== Уведомления ==="
-input bool               InpUseAlert      = true;       // всплывающий Alert()
-input bool               InpUseSound      = false;      // звук
-input string             InpSoundFile     = "alert.wav";
-input bool               InpUsePush       = false;      // Push на телефон (Settings -> Notifications)
+input bool               InpUseAlert      = true;                // Всплывающий Alert()
+input bool               InpUseSound      = false;               // Звук
+input string             InpSoundFile     = "alert.wav";         // Звуковой файл
+input bool               InpUsePush       = false;               // Push на телефон (Settings -> Notifications)
+input bool               InpUseEmail      = false;               // Email (требует SMTP в Tools->Options->Email)
 
 input group "=== Сохранение состояния ==="
-input bool               InpUsePersistence= true;       // сохранять paused/BE/TSL/peaks через GlobalVariables
+input bool               InpUsePersistence= true;                // Сохранять paused/BE/TSL/peaks через GlobalVariables
 
 input group "=== Безусловная сетка (limit-ордера) ==="
-input bool               InpUseUncondGrid     = false;
-input ENUM_GRID_SIDE     InpGridSide          = GRID_BOTH;
-input int                InpGridLevels        = 5;
-input int                InpGridStepPoints    = 200;
-input double             InpGridStartLot      = 0.01;
-input double             InpGridLotMultiplier = 1.0;     // 1.0 = одинаковый лот, >1 = мартингейл-сетка
-input bool               InpGridReplaceFilled = false;   // переоткрывать сработавшие уровни
+input bool               InpUseUncondGrid     = false;           // Включить безусловную сетку лимитников
+input ENUM_GRID_SIDE     InpGridSide          = GRID_BOTH;       // Сторона сетки
+input int                InpGridLevels        = 5;               // Количество уровней
+input int                InpGridStepPoints    = 200;             // Шаг между уровнями (пункты)
+input double             InpGridStartLot      = 0.01;            // Лот первого уровня
+input double             InpGridLotMultiplier = 1.0;             // Множитель лота (1.0 = одинаковый, >1 = мартингейл)
+input bool               InpGridReplaceFilled = false;           // Переоткрывать сработавшие уровни
+
+input group "=== Ручная торговля (тестер/график) ==="
+input bool               InpShowManualButtons = true;            // Показывать кнопки ручного открытия BUY/SELL
+input double             InpManualLot         = 0.01;            // Лот для ручных кнопок BUY/SELL
 
 input group "=== Панель ==="
-input bool               InpShowPanel     = true;
-input color              InpPanelColor    = clrWhite;
-input int                InpPanelFontSize = 10;
+input bool               InpShowPanel     = true;                // Показывать панель на графике
+input color              InpPanelColor    = clrWhite;            // Цвет текста панели
+input int                InpPanelFontSize = 10;                  // Размер шрифта панели
+
+input group "=== Диагностика ==="
+input bool               InpDebugManaged  = false;               // Логировать каждые 10 сек, какие позиции попали в корзину и почему
 
 //=== Globals ========================================================
 CTrade         trade;
@@ -229,20 +316,63 @@ double  g_lockPeakBuy    = 0.0;
 double  g_lockPeakSell   = 0.0;
 int     g_relockCount    = 0;
 
+// Standby mode
+bool    g_recoveryTriggered = false;       // true once start trigger has fired
+double  g_baselineBalance   = 0.0;         // captured at OnInit for % drawdown calc
+bool    g_otherEAsDisabled  = false;       // disable-other-EAs done once
+
+// Partial Recovery state
+ENUM_PR_PHASE g_prPhase     = PR_IDLE;
+datetime      g_prLastBarTime = 0;         // for one-per-bar averagers (BUY side)
+datetime      g_prLastBarTimeS= 0;         // for one-per-bar averagers (SELL side)
+int           g_prAvgCountBuy = 0;
+int           g_prAvgCountSell= 0;
+
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
 
-#define BTN_CLOSE_ALL  "RECOVERI_BTN_CLOSE_ALL"
-#define BTN_CLOSE_BUY  "RECOVERI_BTN_CLOSE_BUY"
-#define BTN_CLOSE_SELL "RECOVERI_BTN_CLOSE_SELL"
-#define BTN_PAUSE      "RECOVERI_BTN_PAUSE"
-#define BTN_LOCK       "RECOVERI_BTN_LOCK"
-#define BTN_RESET      "RECOVERI_BTN_RESET"
+// Diagnostics: throttle for debug dump
+datetime g_lastDebugDump = 0;
+
+#define BTN_CLOSE_ALL    "RECOVERI_BTN_CLOSE_ALL"
+#define BTN_CLOSE_BUY    "RECOVERI_BTN_CLOSE_BUY"
+#define BTN_CLOSE_SELL   "RECOVERI_BTN_CLOSE_SELL"
+#define BTN_PAUSE        "RECOVERI_BTN_PAUSE"
+#define BTN_LOCK         "RECOVERI_BTN_LOCK"
+#define BTN_RESET        "RECOVERI_BTN_RESET"
+#define BTN_MANUAL_BUY   "RECOVERI_BTN_MANUAL_BUY"
+#define BTN_MANUAL_SELL  "RECOVERI_BTN_MANUAL_SELL"
 
 //+------------------------------------------------------------------+
 int OnInit()
   {
    // --- Input validation ---
+   if(InpStartTrigger != START_INSTANT && InpStartThreshold <= 0)
+     {
+      Print("InpStartThreshold must be > 0 when InpStartTrigger != INSTANT");
+      return INIT_PARAMETERS_INCORRECT;
+     }
+
+   if(InpMode == MODE_PARTIAL_RECOVERY)
+     {
+      if(InpPartCloseLot <= 0)
+        { Print("InpPartCloseLot must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAvgVolume <= 0)
+        { Print("InpAvgVolume must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAvgVolume < InpPartCloseLot)
+        Print("WARNING: InpAvgVolume (", InpAvgVolume,
+              ") < InpPartCloseLot (", InpPartCloseLot,
+              "). Recommended ratio is 1.5x. Recovery may be unstable.");
+      if(InpAvgStepPts <= 0)
+        { Print("InpAvgStepPts must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAvgTPpts <= 0)
+        { Print("InpAvgTPpts must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpMaxAveragers <= 0)
+        { Print("InpMaxAveragers must be > 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpUseTrendFilter && (InpTrendFastMA <= 0 || InpTrendSlowMA <= 0 || InpTrendFastMA >= InpTrendSlowMA))
+        { Print("Trend filter MA periods invalid (need 0<fast<slow)"); return INIT_PARAMETERS_INCORRECT; }
+     }
+
    if(InpMode == MODE_HEDGE_LOCK)
      {
       if(InpLockTriggerLoss <= 0)
@@ -293,13 +423,17 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    trade.SetMarginMode();
    trade.LogLevel(LOG_LEVEL_ERRORS);
+   if(InpShowManualButtons && InpManualLot <= 0)
+      Print("WARNING: InpShowManualButtons=true but InpManualLot<=0; manual buttons will refuse to open.");
    g_gvPrefix = StringFormat("RECOVERI_%s_%I64d_", _Symbol, InpMagic);
+   g_baselineBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    if(InpUsePersistence) LoadState();
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.30 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Magic=%I64d",
+   PrintFormat("RECOVERI v1.40 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
-               (int)InpAutoUnlock, InpMagic);
+               (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
+   if(InpDebugManaged) DebugDumpPositions(true);
    return INIT_SUCCEEDED;
   }
 
@@ -308,12 +442,28 @@ void OnDeinit(const int reason)
   {
    if(InpUsePersistence) SaveState();
    ObjectsDeleteAll(0, g_panelPrefix);
+   // Clear our own IPC disable flags so siblings don't ricochet on re-launch
+   if(InpDisableOtherEAs == DISABLE_ALL_SYMBOLS && GlobalVariableCheck("RECOVERI_DISABLE_ALL"))
+      GlobalVariableDel("RECOVERI_DISABLE_ALL");
+   if(InpDisableOtherEAs == DISABLE_SAME_SYMBOL)
+     {
+      string key = StringFormat("RECOVERI_DISABLE_%s", _Symbol);
+      if(GlobalVariableCheck(key)) GlobalVariableDel(key);
+     }
    ChartRedraw(0);
   }
 
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   // Self-disable signal from a sibling RECOVERI instance
+   if(InpDisableOtherEAs == DISABLE_NONE && CheckSelfDisableSignal())
+     {
+      Print("RECOVERI: self-disable signal received from sibling instance, removing.");
+      ExpertRemove();
+      return;
+     }
+
    if(CheckEmergencyStop())
      {
       CloseAllManaged();
@@ -332,19 +482,32 @@ void OnTick()
 
    BasketState bs;
    BuildBasket(bs);
+   if(InpDebugManaged) DebugDumpPositions();
    ApplyBasketTrailing(bs);
 
    if(bs.count > 0 && CheckBasketTargets(bs))
       BuildBasket(bs);
 
-   if(!InpCloseOnly && bs.count > 0 && IsTradingAllowed())
+   // --- Standby trigger check (gates new-position opening below) ---
+   bool triggered = IsRecoveryTriggered(bs);
+
+   if(!InpCloseOnly && bs.count > 0 && IsTradingAllowed() && triggered)
      {
+      // Disable other EAs once, when trigger fires for the first time
+      if(InpDisableOtherEAs != DISABLE_NONE && !g_otherEAsDisabled)
+        {
+         DisableOtherEAs();
+         g_otherEAsDisabled = true;
+         if(InpUsePersistence) SaveState();
+        }
+
       switch(InpMode)
         {
-         case MODE_AVERAGING:    DoAveraging(bs);  break;
-         case MODE_MARTINGALE:   DoMartingale(bs); break;
-         case MODE_HEDGE_LOCK:   DoHedgeLock(bs);  break;
-         case MODE_SMART_CLOSE:  DoSmartClose(bs); break;
+         case MODE_AVERAGING:        DoAveraging(bs);        break;
+         case MODE_MARTINGALE:       DoMartingale(bs);       break;
+         case MODE_HEDGE_LOCK:       DoHedgeLock(bs);        break;
+         case MODE_SMART_CLOSE:      DoSmartClose(bs);       break;
+         case MODE_PARTIAL_RECOVERY: DoPartialRecovery(bs);  break;
          case MODE_TARGET_PROFIT: break;
         }
      }
@@ -362,9 +525,55 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    else if(sparam == BTN_PAUSE)      { g_paused = !g_paused; PrintFormat("BTN: Pause=%s", g_paused?"ON":"OFF"); if(InpUsePersistence) SaveState(); }
    else if(sparam == BTN_LOCK)       { Print("BTN: Lock Now");     ForceLockNow(); }
    else if(sparam == BTN_RESET)      { Print("BTN: Reset Stop");   g_emergencyStop = false; if(InpUsePersistence) SaveState(); }
+   else if(sparam == BTN_MANUAL_BUY) { Print("BTN: Manual BUY");   DoManualOpen(ORDER_TYPE_BUY); }
+   else if(sparam == BTN_MANUAL_SELL){ Print("BTN: Manual SELL");  DoManualOpen(ORDER_TYPE_SELL); }
 
    ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
    ChartRedraw(0);
+  }
+
+//+------------------------------------------------------------------+
+//| Diagnostic: dump every position on the account and explain       |
+//| whether IsManaged() picks it up. Throttled to once per 10s.      |
+//+------------------------------------------------------------------+
+void DebugDumpPositions(const bool force = false)
+  {
+   if(!InpDebugManaged && !force) return;
+   datetime now = TimeCurrent();
+   if(!force && now - g_lastDebugDump < 10) return;
+   g_lastDebugDump = now;
+
+   int total = PositionsTotal();
+   PrintFormat("DBG dump: PositionsTotal=%d, _Symbol=%s, ManageScope=%d, SymbolScope=%d, Magic=%I64d",
+               total, _Symbol, (int)InpManageScope, (int)InpSymbolScope, InpMagic);
+   if(total == 0)
+     {
+      Print("  (no open positions on the account)");
+      return;
+     }
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!pos.SelectByTicket(t))
+        {
+         PrintFormat("  #%I64u: SelectByTicket failed", t);
+         continue;
+        }
+      string posSym = pos.Symbol();
+      long   m      = pos.Magic();
+      string typ    = (pos.PositionType() == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      double vol    = pos.Volume();
+      double pft    = pos.Profit() + pos.Swap() + pos.Commission();
+      string verdict = "MANAGED";
+      if(InpSymbolScope == SCOPE_CURRENT && posSym != _Symbol)
+         verdict = StringFormat("SKIP (symbol '%s' != '%s')", posSym, _Symbol);
+      else if(InpManageScope == MANAGE_MANUAL && m != 0)
+         verdict = StringFormat("SKIP (MANAGE_MANUAL: magic=%I64d != 0)", m);
+      else if(InpManageScope == MANAGE_OWN && m != InpMagic)
+         verdict = StringFormat("SKIP (MANAGE_OWN: magic=%I64d != %I64d)", m, InpMagic);
+      PrintFormat("  #%I64u sym='%s' magic=%I64d %s %.2f P/L=%.2f -> %s",
+                  t, posSym, m, typ, vol, pft, verdict);
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -560,6 +769,56 @@ void ForceLockNow()
   }
 
 //+------------------------------------------------------------------+
+//| Manual market order from panel button                            |
+//|   Used in Strategy Tester (visual mode) and on live charts to    |
+//|   open a position by hand. EA picks it up automatically because  |
+//|   the magic equals InpMagic. After that all standard recovery    |
+//|   logic applies: targets, virtual SL/TP/TSL, basket trailing,    |
+//|   averaging/martingale, hedge-lock with auto-unwind, etc.        |
+//+------------------------------------------------------------------+
+void DoManualOpen(const ENUM_ORDER_TYPE side)
+  {
+   if(InpSymbolScope != SCOPE_CURRENT)
+     {
+      Print("Manual open: requires SCOPE_CURRENT (manage scope = current symbol)");
+      Notify("Manual open: SCOPE_CURRENT required");
+      return;
+     }
+   if(g_emergencyStop)
+     {
+      Print("Manual open blocked: emergency stop is active. Press 'Reset Stop' first.");
+      Notify("Manual open blocked: EMERGENCY STOP");
+      return;
+     }
+   if(!SpreadOK(_Symbol))
+     {
+      PrintFormat("Manual open blocked: spread > InpMaxSpreadPts=%.0f", InpMaxSpreadPts);
+      Notify("Manual open blocked: spread too wide");
+      return;
+     }
+   if(InpManualLot <= 0)
+     {
+      Print("Manual open: InpManualLot must be > 0");
+      Notify("Manual open: InpManualLot <= 0");
+      return;
+     }
+   double lot = NormalizeLot(_Symbol, InpManualLot);
+   if(lot <= 0)
+     {
+      PrintFormat("Manual open: NormalizeLot(%.2f) -> 0 (check broker min/max/step)", InpManualLot);
+      Notify("Manual open: lot normalized to 0");
+      return;
+     }
+   string tag = (side == ORDER_TYPE_BUY) ? "MANUAL-BUY" : "MANUAL-SELL";
+   if(OpenPosition(_Symbol, side, lot, tag))
+     {
+      PrintFormat("Manual %s opened: lot=%.2f", (side==ORDER_TYPE_BUY?"BUY":"SELL"), lot);
+      Notify(StringFormat("Manual %s %.2f opened on %s",
+                          (side==ORDER_TYPE_BUY?"BUY":"SELL"), lot, _Symbol));
+     }
+  }
+
+//+------------------------------------------------------------------+
 bool VirtualBeTriggered(const ulong ticket)
   {
    for(int i=0; i<ArraySize(g_beTickets); i++)
@@ -683,7 +942,7 @@ bool IsNewsBlocked()
      {
       if(list[i] == "") continue;
       MqlCalendarValue values[];
-      int n = CalendarValueHistoryByCurrency(list[i], values, from, to);
+      int n = CalendarValueHistory(values, from, to, NULL, list[i]);
       for(int k=0; k<n; k++)
         {
          MqlCalendarEvent ev;
@@ -1030,6 +1289,489 @@ void DoSmartClose(const BasketState &bs)
   }
 
 //+------------------------------------------------------------------+
+//| Standby trigger: returns true once recovery should be active     |
+//+------------------------------------------------------------------+
+bool IsRecoveryTriggered(const BasketState &bs)
+  {
+   if(g_recoveryTriggered) return true;
+   if(InpStartTrigger == START_INSTANT)
+     { g_recoveryTriggered = true; return true; }
+   if(bs.count == 0) return false;
+   double drawdown = -bs.profit;  // positive number when we are losing
+   if(drawdown <= 0) return false;
+   bool fire = false;
+   if(InpStartTrigger == START_DD_MONEY)
+      fire = (drawdown >= InpStartThreshold);
+   else if(InpStartTrigger == START_DD_PERCENT)
+     {
+      double base = (g_baselineBalance > 0) ? g_baselineBalance : AccountInfoDouble(ACCOUNT_BALANCE);
+      if(base <= 0) return false;
+      double pct = drawdown / base * 100.0;
+      fire = (pct >= InpStartThreshold);
+     }
+   if(fire)
+     {
+      g_recoveryTriggered = true;
+      Notify(StringFormat("STANDBY trigger fired: drawdown=%.2f, threshold=%.2f (%s)",
+             drawdown, InpStartThreshold,
+             InpStartTrigger == START_DD_PERCENT ? "%" : "$"));
+      if(InpUsePersistence) SaveState();
+     }
+   return fire;
+  }
+
+//+------------------------------------------------------------------+
+//| Disable other EAs on this/all symbols (called once on trigger)   |
+//|                                                                  |
+//| MQL5 не позволяет программно отцепить чужой EA с другого графика.|
+//| Поэтому мы:                                                      |
+//|   1) Выставляем глобальную переменную RECOVERI_DISABLE_<symbol>, |
+//|      которую другие экземпляры RECOVERI могут проверять и сами   |
+//|      вызывать ExpertRemove() (см. CheckSelfDisableSignal).       |
+//|   2) Логируем и пушим уведомление пользователю с перечнем чартов |
+//|      с активными EA — закрыть их вручную.                        |
+//+------------------------------------------------------------------+
+void DisableOtherEAs()
+  {
+   long me = ChartID();
+   long cid = ChartFirst();
+   string list = "";
+   int found = 0;
+   while(cid >= 0)
+     {
+      if(cid != me)
+        {
+         string sym2 = ChartSymbol(cid);
+         bool sameSym = (sym2 == _Symbol);
+         bool inScope = (InpDisableOtherEAs == DISABLE_ALL_SYMBOLS) ||
+                        (InpDisableOtherEAs == DISABLE_SAME_SYMBOL && sameSym);
+         if(inScope)
+           {
+            string ename = ChartGetString(cid, CHART_EXPERT_NAME);
+            if(ename != "" && ename != MQLInfoString(MQL_PROGRAM_NAME))
+              {
+               list += StringFormat("%s[%s] ", sym2, ename);
+               found++;
+              }
+           }
+        }
+      cid = ChartNext(cid);
+     }
+   // Set IPC signal that sibling RECOVERI instances can self-detach via
+   if(InpDisableOtherEAs == DISABLE_ALL_SYMBOLS)
+      GlobalVariableSet("RECOVERI_DISABLE_ALL", (double)TimeCurrent());
+   else if(InpDisableOtherEAs == DISABLE_SAME_SYMBOL)
+      GlobalVariableSet(StringFormat("RECOVERI_DISABLE_%s", _Symbol), (double)TimeCurrent());
+
+   PrintFormat("DisableOtherEAs: scope=%d charts_with_EA=%d list=%s",
+               (int)InpDisableOtherEAs, found, list);
+   if(found > 0)
+      Notify(StringFormat("WARNING: %d other EAs detected: %s. Detach them manually.", found, list));
+  }
+
+//+------------------------------------------------------------------+
+//| Check IPC signal from another RECOVERI: self-detach if matched   |
+//+------------------------------------------------------------------+
+bool CheckSelfDisableSignal()
+  {
+   if(GlobalVariableCheck("RECOVERI_DISABLE_ALL")) return true;
+   if(GlobalVariableCheck(StringFormat("RECOVERI_DISABLE_%s", _Symbol))) return true;
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Trend filter (MA-cross on higher TF). Returns +1/-1/0.           |
+//+------------------------------------------------------------------+
+int TrendDirection()
+  {
+   if(!InpUseTrendFilter) return 0;  // 0 = no filter active, treat as neutral
+   double fast[2], slow[2];
+   int hF = iMA(_Symbol, InpTrendTF, InpTrendFastMA, 0, MODE_EMA, PRICE_CLOSE);
+   int hS = iMA(_Symbol, InpTrendTF, InpTrendSlowMA, 0, MODE_EMA, PRICE_CLOSE);
+   if(hF == INVALID_HANDLE || hS == INVALID_HANDLE) return 0;
+   if(CopyBuffer(hF, 0, 0, 2, fast) <= 0) { IndicatorRelease(hF); IndicatorRelease(hS); return 0; }
+   if(CopyBuffer(hS, 0, 0, 2, slow) <= 0) { IndicatorRelease(hF); IndicatorRelease(hS); return 0; }
+   IndicatorRelease(hF); IndicatorRelease(hS);
+   if(fast[0] > slow[0]) return +1;
+   if(fast[0] < slow[0]) return -1;
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| One-Per-Bar helper: did a new bar appear since last open?        |
+//+------------------------------------------------------------------+
+bool IsNewBar(datetime &lastBar)
+  {
+   datetime cur = iTime(_Symbol, _Period, 0);
+   if(cur == 0) return false;
+   if(cur != lastBar) { lastBar = cur; return true; }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Close an arbitrary lot from a specific position (partial close). |
+//+------------------------------------------------------------------+
+bool ClosePartOfPosition(const ulong ticket, double lotToClose)
+  {
+   if(!pos.SelectByTicket(ticket)) return false;
+   double posVol = pos.Volume();
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+   if(lotToClose >= posVol)
+      return trade.PositionClose(ticket, (ulong)InpSlippage);
+   double v = MathFloor(lotToClose/step + 1e-7) * step;
+   if(v < minLot) v = minLot;
+   if(v >= posVol) return trade.PositionClose(ticket, (ulong)InpSlippage);
+   bool ok = trade.PositionClosePartial(ticket, NormalizeDouble(v, 2), (ulong)InpSlippage);
+   if(!ok) PrintFormat("PositionClosePartial #%I64u %.2f failed err=%d ret=%d",
+                       ticket, v, GetLastError(), trade.ResultRetcode());
+   return ok;
+  }
+
+//+------------------------------------------------------------------+
+//| Are there any *original* losing positions (not lock, not avg)?   |
+//+------------------------------------------------------------------+
+bool HasLosingOriginalPositions()
+  {
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      string cmt = pos.Comment();
+      if(StringFind(cmt, "PR-AVG") >= 0) continue;
+      if(StringFind(cmt, "PR-LOCK") >= 0) continue;
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      if(pft < 0) return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Pick the next losing-side ticket to chip away at, by priority.   |
+//|   side=BUY  => the worst BUY we own                              |
+//|   side=SELL => the worst SELL we own                             |
+//+------------------------------------------------------------------+
+ulong PickLosingTicket(const ENUM_POSITION_TYPE side)
+  {
+   if(InpRecoveryPriority == PRIO_FIRST_TICKET && InpFirstTicket != 0)
+     {
+      if(pos.SelectByTicket(InpFirstTicket) && pos.PositionType() == side &&
+         pos.Symbol() == _Symbol)
+         return InpFirstTicket;
+     }
+   ulong best = 0;
+   double bestPft = (InpRecoveryPriority == PRIO_HARD) ? DBL_MAX : -DBL_MAX;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != side) continue;
+      // Skip averagers (RECOVERY orders)
+      string cmt = pos.Comment();
+      if(StringFind(cmt, "AVG-") >= 0 || StringFind(cmt, "PR-AVG") >= 0) continue;
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      if(pft >= 0) continue;  // only losing orders are recovery candidates
+      if(InpRecoveryPriority == PRIO_HARD)
+        {
+         if(pft < bestPft) { bestPft = pft; best = t; }
+        }
+      else  // PRIO_EASY (and fallback for FIRST_TICKET miss)
+        {
+         if(pft > bestPft) { bestPft = pft; best = t; }
+        }
+     }
+   return best;
+  }
+
+//+------------------------------------------------------------------+
+//| Closing-overlap helper: keep only first+last averagers on a side |
+//|   Closes intermediate averagers if their count >= InpOverlapAfterN |
+//+------------------------------------------------------------------+
+void ApplyClosingOverlap(const ENUM_POSITION_TYPE side, const string avgTag)
+  {
+   if(InpOverlapAfterN <= 2) return;
+   ulong tickets[];
+   datetime times[];
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != side) continue;
+      if(StringFind(pos.Comment(), avgTag) < 0) continue;
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      if(pft <= 0) continue;  // only candidates that are profitable
+      int n = ArraySize(tickets);
+      ArrayResize(tickets, n+1);
+      ArrayResize(times,   n+1);
+      tickets[n] = t;
+      times[n]   = (datetime)pos.Time();
+     }
+   int n = ArraySize(tickets);
+   if(n < InpOverlapAfterN) return;
+   // Sort by time ascending (bubble sort - n is small)
+   for(int i = 0; i < n-1; i++)
+      for(int j = 0; j < n-i-1; j++)
+         if(times[j] > times[j+1])
+           {
+            datetime tt = times[j]; times[j] = times[j+1]; times[j+1] = tt;
+            ulong   tk = tickets[j]; tickets[j] = tickets[j+1]; tickets[j+1] = tk;
+           }
+   // Close everything except first and last
+   for(int i = 1; i < n-1; i++)
+      if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
+         PrintFormat("Overlap close #%I64u", tickets[i]);
+  }
+
+//+------------------------------------------------------------------+
+//| MODE_PARTIAL_RECOVERY: lock + grid averagers + partial closing   |
+//|                                                                  |
+//| Strategy (a la AW Recovery, simplified & open-source):           |
+//|   1) PR_IDLE     - wait for trigger (handled by IsRecoveryTriggered)
+//|   2) PR_LOCKING  - balance volumes BUY/SELL into a lock          |
+//|   3) PR_RECOVERING -                                             |
+//|        - open averagers (grid step + multiplier)                 |
+//|        - on each averager that hits +TP_pts, close it AND        |
+//|          chip InpPartCloseLot from the worst losing position     |
+//|        - optional trend filter, one-per-bar, closing overlap     |
+//|   4) PR_DONE     - all losing positions closed; reset state      |
+//+------------------------------------------------------------------+
+void DoPartialRecovery(const BasketState &bs)
+  {
+   if(InpSymbolScope != SCOPE_CURRENT) return;
+   if(!SpreadOK(_Symbol)) return;
+
+   //--- universal reset -------------------------------------------------
+   if(bs.count == 0)
+     {
+      if(g_prPhase != PR_IDLE)
+        {
+         PrintFormat("PartialRecovery: basket empty -> PR_IDLE (was %d)", (int)g_prPhase);
+         Notify("Partial recovery complete");
+         g_prPhase = PR_IDLE;
+         g_prAvgCountBuy = 0; g_prAvgCountSell = 0;
+         if(InpAutoResetAfterDone) g_recoveryTriggered = false;
+         if(InpUsePersistence) SaveState();
+        }
+      return;
+     }
+
+   //--- detect entry ----------------------------------------------------
+   if(g_prPhase == PR_IDLE)
+     {
+      g_prPhase = PR_LOCKING;
+      Notify("Partial recovery: PR_LOCKING (balancing volumes)");
+      if(InpUsePersistence) SaveState();
+     }
+
+   //--- compute net to lock --------------------------------------------
+   double netVol  = bs.buyVolume - bs.sellVolume;
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   //--- PR_LOCKING ------------------------------------------------------
+   if(g_prPhase == PR_LOCKING)
+     {
+      if(MathAbs(netVol) < minLot)
+        {
+         g_prPhase = PR_RECOVERING;
+         Notify("Partial recovery: locked, PR_RECOVERING (open averagers)");
+         if(InpUsePersistence) SaveState();
+        }
+      else
+        {
+         if(bs.count >= InpMaxTrades) return;
+         double lot = NormalizeLot(_Symbol, MathAbs(netVol));
+         if(lot <= 0) return;
+         ENUM_ORDER_TYPE side = (netVol > 0) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+         if(OpenPosition(_Symbol, side, lot, "PR-LOCK"))
+           {
+            PrintFormat("PR-LOCK %s %.2f", EnumToString(side), lot);
+            return;  // wait next tick to re-evaluate
+           }
+        }
+     }
+
+   //--- PR_RECOVERING ---------------------------------------------------
+   if(g_prPhase != PR_RECOVERING) return;
+
+   //--- Sanity: any losing original positions left?  If not -> close all.
+   if(!HasLosingOriginalPositions())
+     {
+      Print("PR: no losing original positions left -> closing residual lock+averagers");
+      Notify("Partial recovery DONE: closing residual basket");
+      CloseAllManaged();
+      g_prPhase = PR_DONE;
+      if(InpUsePersistence) SaveState();
+      return;
+     }
+
+   //--- 1) Process profitable averagers => close them + chip away loss --
+   ProcessProfitableAveragers(bs);
+
+   //--- 2) Closing overlap on long averager chains ----------------------
+   ApplyClosingOverlap(POSITION_TYPE_BUY,  "PR-AVG-B");
+   ApplyClosingOverlap(POSITION_TYPE_SELL, "PR-AVG-S");
+
+   //--- 3) Open new averagers if conditions are met --------------------
+   if(InpCloseOnly) return;
+   if(bs.count >= InpMaxTrades) return;
+
+   sym.Name(_Symbol); sym.RefreshRates();
+   double pt   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double bid  = sym.Bid();
+   double ask  = sym.Ask();
+   if(pt <= 0) return;
+
+   int trend = TrendDirection();  // +1 / -1 / 0(filter off or neutral)
+
+   // BUY averager (covers SELL losing baskets if non-bidirectional)
+   bool wantBuy  = false;
+   bool wantSell = false;
+   if(InpPRBidirectional)
+     {
+      wantBuy  = true;
+      wantSell = true;
+     }
+   else
+     {
+      // open averager opposite to the heavier losing side
+      if(bs.sellProfit < bs.buyProfit) wantBuy  = true;  // SELL hurts more, push price up via BUY
+      else                              wantSell = true;
+     }
+
+   // Apply trend filter
+   if(InpUseTrendFilter && trend != 0)
+     {
+      if(trend < 0) wantBuy  = false;
+      if(trend > 0) wantSell = false;
+     }
+
+   // BUY averager
+   if(wantBuy && g_prAvgCountBuy < InpMaxAveragers)
+     {
+      double lastB = LastAveragerPrice(POSITION_TYPE_BUY, "PR-AVG-B");
+      double step  = (double)InpAvgStepPts * MathPow(InpAvgStepMul, MathMax(0, g_prAvgCountBuy)) * pt;
+      bool spaceOK = (lastB <= 0) || (ask <= lastB - step);
+      bool barOK   = !InpOneOrderPerBar || IsNewBar(g_prLastBarTime);
+      if(spaceOK && barOK)
+        {
+         double lot = InpAvgVolume * MathPow(InpAvgVolumeMul, MathMax(0, g_prAvgCountBuy));
+         lot = NormalizeLot(_Symbol, lot);
+         if(lot > 0 && OpenPosition(_Symbol, ORDER_TYPE_BUY, lot, "PR-AVG-B"))
+           {
+            g_prAvgCountBuy++;
+            if(InpUsePersistence) SaveState();
+           }
+        }
+     }
+   // SELL averager
+   if(wantSell && g_prAvgCountSell < InpMaxAveragers)
+     {
+      double lastS = LastAveragerPrice(POSITION_TYPE_SELL, "PR-AVG-S");
+      double step  = (double)InpAvgStepPts * MathPow(InpAvgStepMul, MathMax(0, g_prAvgCountSell)) * pt;
+      bool spaceOK = (lastS <= 0) || (bid >= lastS + step);
+      bool barOK   = !InpOneOrderPerBar || IsNewBar(g_prLastBarTimeS);
+      if(spaceOK && barOK)
+        {
+         double lot = InpAvgVolume * MathPow(InpAvgVolumeMul, MathMax(0, g_prAvgCountSell));
+         lot = NormalizeLot(_Symbol, lot);
+         if(lot > 0 && OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "PR-AVG-S"))
+           {
+            g_prAvgCountSell++;
+            if(InpUsePersistence) SaveState();
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Find the latest opening price for an averager of given side+tag. |
+//+------------------------------------------------------------------+
+double LastAveragerPrice(const ENUM_POSITION_TYPE side, const string tag)
+  {
+   double bestPrice = 0;
+   datetime bestTime = 0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != side) continue;
+      if(StringFind(pos.Comment(), tag) < 0) continue;
+      datetime tm = (datetime)pos.Time();
+      if(tm > bestTime)
+        { bestTime = tm; bestPrice = pos.PriceOpen(); }
+     }
+   return bestPrice;
+  }
+
+//+------------------------------------------------------------------+
+//| For each profitable averager: close it, then chip InpPartCloseLot |
+//| off the worst losing position on the OPPOSITE side.               |
+//+------------------------------------------------------------------+
+void ProcessProfitableAveragers(const BasketState &bs)
+  {
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(pt <= 0) return;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   ulong tickets[];
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      string cmt = pos.Comment();
+      if(StringFind(cmt, "PR-AVG") < 0) continue;
+      double op = pos.PriceOpen();
+      ENUM_POSITION_TYPE pt2 = pos.PositionType();
+      double pts = (pt2 == POSITION_TYPE_BUY) ? (bid - op)/pt : (op - ask)/pt;
+      if(pts < InpAvgTPpts) continue;
+      int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = t;
+     }
+
+   for(int i = 0; i < ArraySize(tickets); i++)
+     {
+      if(!pos.SelectByTicket(tickets[i])) continue;
+      ENUM_POSITION_TYPE avgSide = pos.PositionType();
+      double avgVol = pos.Volume();
+
+      // Close the averager
+      if(!trade.PositionClose(tickets[i], (ulong)InpSlippage)) continue;
+      PrintFormat("PR: closed averager #%I64u (%s %.2f)", tickets[i],
+                  avgSide==POSITION_TYPE_BUY?"BUY":"SELL", avgVol);
+      if(avgSide == POSITION_TYPE_BUY) g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy-1);
+      else                              g_prAvgCountSell = MathMax(0, g_prAvgCountSell-1);
+
+      // Chip a part off the worst losing position on the OPPOSITE side
+      ENUM_POSITION_TYPE losingSide = (avgSide == POSITION_TYPE_BUY)
+                                       ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+      ulong target = PickLosingTicket(losingSide);
+      if(target == 0)
+        {
+         // Try same side (case where averager was opened against the bigger loss)
+         target = PickLosingTicket(avgSide);
+        }
+      if(target != 0)
+        {
+         if(ClosePartOfPosition(target, InpPartCloseLot))
+            PrintFormat("PR: chipped %.2f from loser #%I64u (priority=%d)",
+                        InpPartCloseLot, target, (int)InpRecoveryPriority);
+        }
+      else
+        {
+         PrintFormat("PR: no losing tickets to chip; recovery may be near completion");
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Open a market order with the EA's magic number                   |
+//+------------------------------------------------------------------+
 bool OpenPosition(const string symbol, const ENUM_ORDER_TYPE type, double lot, const string tag)
   {
    if(lot <= 0) return false;
@@ -1111,6 +1853,14 @@ void CreatePanel()
    CreateButton(BTN_CLOSE_SELL, 10+bw+gap,     btnY+bh+gap,      bw, bh, "Close SELL", clrIndianRed, clrWhite);
    CreateButton(BTN_LOCK,       10,            btnY+2*(bh+gap),  bw, bh, "Lock Now",   clrGoldenrod, clrBlack);
    CreateButton(BTN_RESET,      10+bw+gap,     btnY+2*(bh+gap),  bw, bh, "Reset Stop", clrDarkGreen, clrWhite);
+   if(InpShowManualButtons)
+     {
+      // Lot label above the manual row
+      CreateLabel("manualLot", 10, btnY+3*(bh+gap)+2);
+      // Manual market open buttons
+      CreateButton(BTN_MANUAL_BUY,  10,        btnY+4*(bh+gap), bw, bh, "BUY (manual)",  clrTeal,      clrWhite);
+      CreateButton(BTN_MANUAL_SELL, 10+bw+gap, btnY+4*(bh+gap), bw, bh, "SELL (manual)", clrDarkOrange, clrWhite);
+     }
   }
 
 void SetLabel(const string key, const string text, color clr = clrNONE)
@@ -1128,11 +1878,12 @@ void UpdatePanel(const BasketState &bs)
    string modeName = "";
    switch(InpMode)
      {
-      case MODE_TARGET_PROFIT: modeName="TargetProfit"; break;
-      case MODE_AVERAGING:     modeName="Averaging";    break;
-      case MODE_MARTINGALE:    modeName="Martingale";   break;
-      case MODE_HEDGE_LOCK:    modeName="HedgeLock";    break;
-      case MODE_SMART_CLOSE:   modeName="SmartClose";   break;
+      case MODE_TARGET_PROFIT:    modeName="TargetProfit";    break;
+      case MODE_AVERAGING:        modeName="Averaging";       break;
+      case MODE_MARTINGALE:       modeName="Martingale";      break;
+      case MODE_HEDGE_LOCK:       modeName="HedgeLock";       break;
+      case MODE_SMART_CLOSE:      modeName="SmartClose";      break;
+      case MODE_PARTIAL_RECOVERY: modeName="PartialRecovery"; break;
      }
    string scopeName = (InpManageScope==MANAGE_ALL ? "ALL"
                        : InpManageScope==MANAGE_MANUAL ? "MANUAL" : "OWN");
@@ -1144,7 +1895,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.30 ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.40 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -1166,8 +1917,25 @@ void UpdatePanel(const BasketState &bs)
       SetLabel("target", StringFormat("Target: B=%.2f S=%.2f", tgtBuy, tgtSell));
      }
 
-   // Lock-unwind status
-   if(InpMode == MODE_HEDGE_LOCK && InpAutoUnlock)
+   // Lock-unwind status / Partial-Recovery status
+   if(InpMode == MODE_PARTIAL_RECOVERY)
+     {
+      string prName = "";
+      color  prClr  = InpPanelColor;
+      switch(g_prPhase)
+        {
+         case PR_IDLE:        prName = "IDLE (waiting)"; prClr = clrSilver;       break;
+         case PR_LOCKING:     prName = "LOCKING";        prClr = clrGold;         break;
+         case PR_RECOVERING:  prName = "RECOVERING";     prClr = clrLightSkyBlue; break;
+         case PR_DONE:        prName = "DONE";           prClr = clrLime;         break;
+        }
+      string trigStr = g_recoveryTriggered ? "TRIGGERED" : "ARMED";
+      SetLabel("lock", StringFormat("PR: %s [%s] avgB=%d avgS=%d trend=%d",
+                                    prName, trigStr,
+                                    g_prAvgCountBuy, g_prAvgCountSell,
+                                    TrendDirection()), prClr);
+     }
+   else if(InpMode == MODE_HEDGE_LOCK && InpAutoUnlock)
      {
       string phaseName = "";
       color  phaseClr  = InpPanelColor;
@@ -1186,7 +1954,9 @@ void UpdatePanel(const BasketState &bs)
      }
    else
      {
-      SetLabel("lock", "Unwind: off");
+      string trigStr = (InpStartTrigger == START_INSTANT) ? "instant" :
+                       (g_recoveryTriggered ? "TRIGGERED" : StringFormat("ARMED (thr=%.1f)", InpStartThreshold));
+      SetLabel("lock", StringFormat("Trigger: %s", trigStr));
      }
 
 
@@ -1205,6 +1975,8 @@ void UpdatePanel(const BasketState &bs)
    SetLabel("stop", statusText, statusClr);
 
    ObjectSetString(0, BTN_PAUSE, OBJPROP_TEXT, g_paused ? "Resume" : "Pause");
+   if(InpShowManualButtons)
+      SetLabel("manualLot", StringFormat("Manual lot: %.2f", InpManualLot), clrLightGray);
    ChartRedraw(0);
   }
 //+------------------------------------------------------------------+
@@ -1220,6 +1992,7 @@ void Notify(const string text)
    if(InpUseAlert) Alert(tag);
    if(InpUseSound && InpSoundFile != "") PlaySound(InpSoundFile);
    if(InpUsePush)  SendNotification(tag);
+   if(InpUseEmail) SendMail(StringFormat("RECOVERI %s", _Symbol), tag);
   }
 
 //+------------------------------------------------------------------+
@@ -1325,6 +2098,10 @@ void SaveState()
    GlobalVariableSet(g_gvPrefix + "LK_PB",   g_lockPeakBuy);
    GlobalVariableSet(g_gvPrefix + "LK_PS",   g_lockPeakSell);
    GlobalVariableSet(g_gvPrefix + "LK_RC",   (double)g_relockCount);
+   GlobalVariableSet(g_gvPrefix + "RC_TRIG", g_recoveryTriggered ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "BASE_BAL",g_baselineBalance);
+   GlobalVariableSet(g_gvPrefix + "OEAS_DIS",g_otherEAsDisabled  ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "PR_PH",   (double)g_prPhase);
 
    // Wipe stale BE/TSL globals for tickets no longer present
    int total = GlobalVariablesTotal();
@@ -1357,6 +2134,10 @@ void LoadState()
    if(GlobalVariableCheck(g_gvPrefix + "LK_PB"))  g_lockPeakBuy    = GlobalVariableGet(g_gvPrefix + "LK_PB");
    if(GlobalVariableCheck(g_gvPrefix + "LK_PS"))  g_lockPeakSell   = GlobalVariableGet(g_gvPrefix + "LK_PS");
    if(GlobalVariableCheck(g_gvPrefix + "LK_RC"))  g_relockCount    = (int)GlobalVariableGet(g_gvPrefix + "LK_RC");
+   if(GlobalVariableCheck(g_gvPrefix + "RC_TRIG"))g_recoveryTriggered = (GlobalVariableGet(g_gvPrefix + "RC_TRIG") > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "BASE_BAL"))g_baselineBalance  = GlobalVariableGet(g_gvPrefix + "BASE_BAL");
+   if(GlobalVariableCheck(g_gvPrefix + "OEAS_DIS"))g_otherEAsDisabled = (GlobalVariableGet(g_gvPrefix + "OEAS_DIS") > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "PR_PH"))  g_prPhase        = (ENUM_PR_PHASE)(int)GlobalVariableGet(g_gvPrefix + "PR_PH");
 
    ArrayResize(g_beTickets, 0);
    ArrayResize(g_tslTickets, 0);
@@ -1371,10 +2152,26 @@ void LoadState()
       else if(StringFind(n, "RECOVERI_TSL_") == 0)
         { ticket = (ulong)StringToInteger(StringSubstr(n, 13)); if(PositionSelectByTicket(ticket)) TslSet(ticket, GlobalVariableGet(n)); }
      }
-   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d",
+   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d trig=%d prPhase=%d",
                g_paused, g_emergencyStop, g_peakProfit, g_peakBuyProfit, g_peakSellProfit,
                ArraySize(g_beTickets), ArraySize(g_tslTickets),
-               (int)g_lockPhase, (int)g_remainingSide, g_relockCount);
+               (int)g_lockPhase, (int)g_remainingSide, g_relockCount,
+               (int)g_recoveryTriggered, (int)g_prPhase);
+
+   //--- Recompute partial-recovery averager counts from open positions ---
+   g_prAvgCountBuy = 0;
+   g_prAvgCountSell = 0;
+   int posTotal = PositionsTotal();
+   for(int i = 0; i < posTotal; i++)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(!IsManaged(tk)) continue;
+      string cmt = pos.Comment();
+      if(StringFind(cmt, "PR-AVG-B") >= 0) g_prAvgCountBuy++;
+      if(StringFind(cmt, "PR-AVG-S") >= 0) g_prAvgCountSell++;
+     }
+   if(g_prAvgCountBuy + g_prAvgCountSell > 0)
+      PrintFormat("PR averagers reconstructed: BUY=%d SELL=%d", g_prAvgCountBuy, g_prAvgCountSell);
   }
 
 
