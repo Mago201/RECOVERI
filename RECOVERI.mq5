@@ -1,7 +1,23 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.43                                                           |
+//|  v1.44                                                           |
+//|  Добавлено в v1.44 (Mode 5 — Partial Recovery):                  |
+//|    - Закрытие старой сетки усреднителей по профиту при смене     |
+//|      тренда. До 1.43 при флипе тренда счётчик усреднителей       |
+//|      сбрасывался на новой стороне, а старые PR-AVG-* позиции на  |
+//|      «уходящей» стороне оставались висеть и каждая отрабатывала  |
+//|      свой собственный InpAvgTPpts; пока они ждали, цена уходила  |
+//|      в новую сторону и старая цепочка садилась в ещё больший     |
+//|      минус. Теперь в момент флипа советник «армирует» старую     |
+//|      сторону: на каждом тике суммирует PnL всех PR-AVG-* на той  |
+//|      стороне, и как только сумма пересекает InpOldGridCloseProfit|
+//|      ($, по умолчанию 0) — закрывает их все разом одной корзиной.|
+//|      Если флип повторится до закрытия — сторона переармируется   |
+//|      на новую «старую». Управляется InpCloseOldGridOnTrendFlip   |
+//|      (по умолчанию true) и InpOldGridCloseProfit. Состояние      |
+//|      сохраняется в GV (PR_COA / PR_COS) и сбрасывается на        |
+//|      смене режима / кнопкой Reset State.                         |
 //|  Добавлено в v1.43 (фиксы режима 5 — Partial Recovery):          |
 //|    - Net-positive guard на партиал-закрытии: при срабатывании TP |
 //|      усреднителя (PR-AVG) теперь ЧИП от убыточной позиции        |
@@ -82,9 +98,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.43"
+#property version   "1.44"
 #property strict
-#property description "Universal MT5 Recovery EA v1.43 - Mode5 net-positive partial close + grid restart on trend flip"
+#property description "Universal MT5 Recovery EA v1.44 - Mode5 close old PR-AVG grid by profit on trend flip"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -259,6 +275,8 @@ input ulong              InpFirstTicket      = 0;                    // Конк
 input bool               InpEnsureNetPositive = true;                // Mode5: гарантировать неотрицательный итог пары (TP усреднителя + чип убыточника)
 input double             InpMinNetProfit      = 0.0;                 // Mode5: минимальный итог пары в валюте депо (>=0)
 input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
+input bool               InpCloseOldGridOnTrendFlip = true;          // Mode5: при смене тренда закрывать старую сетку усреднителей по профиту корзинно
+input double             InpOldGridCloseProfit     = 0.0;            // Mode5: мин. суммарный профит старой сетки для её закрытия (валюта депо, >=0)
 
 input group "=== Тренд-фильтр для усреднителей ==="
 input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
@@ -378,6 +396,12 @@ int           g_prAvgCountBuy = 0;
 int           g_prAvgCountSell= 0;
 int           g_prLastTrend   = 0;         // last seen trend direction (-1/0/+1) for flip detection
 
+// v1.44: close-old-grid-on-trend-flip state.  Set when trend flips while
+// PR_RECOVERING; on each tick we sum PnL of all PR-AVG-* on the marked
+// side and close the whole basket when it crosses InpOldGridCloseProfit.
+bool                g_prCloseOldActive = false;
+ENUM_POSITION_TYPE  g_prCloseOldSide   = POSITION_TYPE_BUY;
+
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
 
@@ -421,6 +445,8 @@ int OnInit()
         { Print("Trend filter MA periods invalid (need 0<fast<slow)"); return INIT_PARAMETERS_INCORRECT; }
       if(InpMinNetProfit < 0)
         { Print("InpMinNetProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpOldGridCloseProfit < 0)
+        { Print("InpOldGridCloseProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
      }
 
    if(InpMode == MODE_HEDGE_LOCK)
@@ -486,7 +512,7 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.43 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.44 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
    return INIT_SUCCEEDED;
@@ -1607,6 +1633,7 @@ void DoPartialRecovery(const BasketState &bs)
          Notify("Partial recovery complete");
          g_prPhase = PR_IDLE;
          g_prAvgCountBuy = 0; g_prAvgCountSell = 0;
+         g_prCloseOldActive = false;     // v1.44: nothing left to flush
          if(InpAutoResetAfterDone) g_recoveryTriggered = false;
          if(InpUsePersistence) SaveState();
         }
@@ -1681,25 +1708,56 @@ void DoPartialRecovery(const BasketState &bs)
 
    int trend = TrendDirection();  // +1 / -1 / 0(filter off or neutral)
 
-   //--- Trend reversal: restart grid counters on the new side -----------
-   // When trend flips (e.g. from -1 to +1) we want a fresh averager chain
-   // on the trend side: the volume/step multiplier resets and the one-per-
-   // bar gate re-arms so a new averager can open immediately.  Existing
-   // averagers on the old side keep running and will close on TP / overlap.
-   if(InpRestartGridOnTrendFlip && trend != 0
-      && g_prLastTrend != 0 && trend != g_prLastTrend)
+   //--- Trend reversal handling (v1.43+v1.44) ---------------------------
+   // We detect a flip once and then conditionally apply two independent
+   // behaviors:
+   //   * v1.43 "restart grid"   - reset counters/bar-gate on the NEW side
+   //                              so a fresh chain can grow immediately;
+   //   * v1.44 "close old grid" - arm the OLD-side PR-AVG basket for a
+   //                              profit-close (TryCloseOldGridByProfit
+   //                              flushes it once combined PnL crosses
+   //                              InpOldGridCloseProfit).
+   // Both can be enabled together; defaults keep prior behavior + the new
+   // basket-flush.
+   bool trendFlipped = (trend != 0 && g_prLastTrend != 0 && trend != g_prLastTrend);
+   if(trendFlipped)
      {
-      PrintFormat("PR: trend flip %d -> %d, restart grid on %s side",
-                  g_prLastTrend, trend, (trend > 0 ? "BUY" : "SELL"));
-      Notify(StringFormat("PR: trend reversal -> restart grid (%s)",
-                          trend > 0 ? "BUY" : "SELL"));
-      if(trend > 0)
-        { g_prAvgCountBuy  = 0; g_prLastBarTime  = 0; }
-      else
-        { g_prAvgCountSell = 0; g_prLastBarTimeS = 0; }
+      PrintFormat("PR: trend flip %d -> %d", g_prLastTrend, trend);
+
+      if(InpRestartGridOnTrendFlip)
+        {
+         Notify(StringFormat("PR: trend reversal -> restart grid (%s)",
+                             trend > 0 ? "BUY" : "SELL"));
+         if(trend > 0)
+           { g_prAvgCountBuy  = 0; g_prLastBarTime  = 0; }
+         else
+           { g_prAvgCountSell = 0; g_prLastBarTimeS = 0; }
+        }
+
+      if(InpCloseOldGridOnTrendFlip)
+        {
+         // Old side = the side that was being grown under the previous
+         // trend.  Re-arming on every flip is fine: even if a previous
+         // close-old was still pending, the new "old side" is now the
+         // direction price just abandoned.
+         g_prCloseOldActive = true;
+         g_prCloseOldSide   = (g_prLastTrend > 0) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+         PrintFormat("PR: arm close-old-grid on %s side (target>=%.2f USD)",
+                     (g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"),
+                     InpOldGridCloseProfit);
+         Notify(StringFormat("PR: arm close-old-grid on %s by profit",
+                             g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"));
+        }
+
       if(InpUsePersistence) SaveState();
      }
    if(trend != 0) g_prLastTrend = trend;
+
+   // Try to flush the armed old-side grid every tick.  The helper closes
+   // and disarms itself once combined PnL >= InpOldGridCloseProfit, or
+   // disarms silently if no PR-AVG-* on the marked side remain.
+   if(g_prCloseOldActive)
+      TryCloseOldGridByProfit();
 
    // BUY averager (covers SELL losing baskets if non-bidirectional)
    bool wantBuy  = false;
@@ -1780,6 +1838,74 @@ double LastAveragerPrice(const ENUM_POSITION_TYPE side, const string tag)
         { bestTime = tm; bestPrice = pos.PriceOpen(); }
      }
    return bestPrice;
+  }
+
+//+------------------------------------------------------------------+
+//| v1.44: close-old-grid-by-profit.                                  |
+//|                                                                   |
+//| When trend flips while PR_RECOVERING, DoPartialRecovery arms      |
+//| g_prCloseOldActive=true and tags the OLD trend side                |
+//| (g_prCloseOldSide).  This helper is called every tick afterwards: |
+//|   1) Iterate every managed PR-AVG-* position on the marked side,  |
+//|      summing realized+unrealized PnL (Profit + Swap + Commission).|
+//|   2) If no such positions remain (TP/overlap/etc closed them all),|
+//|      disarm and persist.                                          |
+//|   3) If sum >= InpOldGridCloseProfit, close the entire batch in   |
+//|      one pass and disarm.  We decrement g_prAvgCount* per closed  |
+//|      ticket so a fresh chain on the new side keeps its multiplier |
+//|      starting from zero (paired with InpRestartGridOnTrendFlip).  |
+//| Note: only PR-AVG-B / PR-AVG-S are flushed.  Lock leg(s)          |
+//| (PR-LOCK) and the original losing positions are NOT touched here. |
+//+------------------------------------------------------------------+
+void TryCloseOldGridByProfit()
+  {
+   if(!g_prCloseOldActive) return;
+
+   string tag = (g_prCloseOldSide == POSITION_TYPE_BUY) ? "PR-AVG-B" : "PR-AVG-S";
+
+   ulong  tickets[];
+   double sum = 0.0;
+   int    total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong tk = PositionGetTicket(i);
+      if(!IsManaged(tk)) continue;                       // also selects pos
+      if(pos.PositionType() != g_prCloseOldSide) continue;
+      if(StringFind(pos.Comment(), tag) < 0) continue;
+      sum += pos.Profit() + pos.Swap() + pos.Commission();
+      int n = ArraySize(tickets); ArrayResize(tickets, n + 1); tickets[n] = tk;
+     }
+
+   if(ArraySize(tickets) == 0)
+     {
+      // Nothing left on the marked side -> auto-disarm.
+      g_prCloseOldActive = false;
+      if(InpUsePersistence) SaveState();
+      return;
+     }
+
+   if(sum < InpOldGridCloseProfit) return;  // wait for combined profit
+
+   int closed = 0;
+   for(int i = 0; i < ArraySize(tickets); i++)
+     {
+      if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
+        {
+         closed++;
+         if(g_prCloseOldSide == POSITION_TYPE_BUY)
+            g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy  - 1);
+         else
+            g_prAvgCountSell = MathMax(0, g_prAvgCountSell - 1);
+        }
+     }
+   PrintFormat("PR: closed old %s grid: %d/%d avg, profit=%.2f (target>=%.2f)",
+               g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
+               closed, ArraySize(tickets), sum, InpOldGridCloseProfit);
+   Notify(StringFormat("PR: old %s grid flushed (%d avg, +%.2f)",
+                       g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                       closed, sum));
+   g_prCloseOldActive = false;
+   if(InpUsePersistence) SaveState();
   }
 
 //+------------------------------------------------------------------+
@@ -2248,6 +2374,8 @@ void SaveState()
    GlobalVariableSet(g_gvPrefix + "BASE_BAL",g_baselineBalance);
    GlobalVariableSet(g_gvPrefix + "OEAS_DIS",g_otherEAsDisabled  ? 1.0 : 0.0);
    GlobalVariableSet(g_gvPrefix + "PR_PH",   (double)g_prPhase);
+   GlobalVariableSet(g_gvPrefix + "PR_COA",  g_prCloseOldActive ? 1.0 : 0.0);
+   GlobalVariableSet(g_gvPrefix + "PR_COS",  (g_prCloseOldSide == POSITION_TYPE_BUY) ? 0.0 : 1.0);
 
    // Wipe stale BE/TSL globals for tickets no longer present
    int total = GlobalVariablesTotal();
@@ -2278,7 +2406,7 @@ ENUM_LOAD_STATUS LoadState()
    // Detect any pre-existing state at all (for clean-vs-legacy distinction)
    string allKeys[] = {"PAUSED","ESTOP","PEAK_C","PEAK_B","PEAK_S","GRID","BASE_BAL",
                        "LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
-                       "RC_TRIG","OEAS_DIS","PR_PH"};
+                       "RC_TRIG","OEAS_DIS","PR_PH","PR_COA","PR_COS"};
    bool anyState = false;
    for(int i = 0; i < ArraySize(allKeys); i++)
       if(GlobalVariableCheck(g_gvPrefix + allKeys[i])) { anyState = true; break; }
@@ -2301,7 +2429,7 @@ ENUM_LOAD_STATUS LoadState()
      {
       // Wipe stale keys so they don't poison future loads.
       string staleKeys[] = {"LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
-                            "RC_TRIG","OEAS_DIS","PR_PH"};
+                            "RC_TRIG","OEAS_DIS","PR_PH","PR_COA","PR_COS"};
       for(int i = 0; i < ArraySize(staleKeys); i++)
         {
          string k = g_gvPrefix + staleKeys[i];
@@ -2315,6 +2443,8 @@ ENUM_LOAD_STATUS LoadState()
       g_recoveryTriggered = false;
       g_otherEAsDisabled  = false;
       g_prPhase           = PR_IDLE;
+      g_prCloseOldActive  = false;
+      g_prCloseOldSide    = POSITION_TYPE_BUY;
      }
    else
      {
@@ -2326,6 +2456,8 @@ ENUM_LOAD_STATUS LoadState()
       if(GlobalVariableCheck(g_gvPrefix + "RC_TRIG")) g_recoveryTriggered = (GlobalVariableGet(g_gvPrefix + "RC_TRIG") > 0.5);
       if(GlobalVariableCheck(g_gvPrefix + "OEAS_DIS"))g_otherEAsDisabled  = (GlobalVariableGet(g_gvPrefix + "OEAS_DIS") > 0.5);
       if(GlobalVariableCheck(g_gvPrefix + "PR_PH"))   g_prPhase           = (ENUM_PR_PHASE)(int)GlobalVariableGet(g_gvPrefix + "PR_PH");
+      if(GlobalVariableCheck(g_gvPrefix + "PR_COA"))  g_prCloseOldActive  = (GlobalVariableGet(g_gvPrefix + "PR_COA") > 0.5);
+      if(GlobalVariableCheck(g_gvPrefix + "PR_COS"))  g_prCloseOldSide    = (GlobalVariableGet(g_gvPrefix + "PR_COS") > 0.5) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
      }
 
    // Stamp current mode for the next load (always, including LS_CLEAN -> first run).
@@ -2346,11 +2478,13 @@ ENUM_LOAD_STATUS LoadState()
         { ticket = (ulong)StringToInteger(StringSubstr(n, 13)); if(PositionSelectByTicket(ticket)) TslSet(ticket, GlobalVariableGet(n)); }
      }
 
-   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d trig=%d prPhase=%d savedMode=%d curMode=%d",
+   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d trig=%d prPhase=%d prCloseOld=%d/%s savedMode=%d curMode=%d",
                g_paused, g_emergencyStop, g_peakProfit, g_peakBuyProfit, g_peakSellProfit,
                ArraySize(g_beTickets), ArraySize(g_tslTickets),
                (int)g_lockPhase, (int)g_remainingSide, g_relockCount,
                (int)g_recoveryTriggered, (int)g_prPhase,
+               (int)g_prCloseOldActive,
+               (g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"),
                savedMode, (int)InpMode);
 
    //--- Recompute partial-recovery averager counts from open positions ---
@@ -2393,6 +2527,8 @@ void DoResetState()
    g_prLastBarTime     = 0;
    g_prLastBarTimeS    = 0;
    g_prLastTrend       = 0;
+   g_prCloseOldActive  = false;
+   g_prCloseOldSide    = POSITION_TYPE_BUY;
    g_recoveryTriggered = false;
    g_otherEAsDisabled  = false;
    g_peakProfit        = 0.0;
@@ -2404,6 +2540,7 @@ void DoResetState()
      {
       string keys[] = {"LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
                        "RC_TRIG","OEAS_DIS","PR_PH",
+                       "PR_COA","PR_COS",
                        "PEAK_C","PEAK_B","PEAK_S"};
       for(int i = 0; i < ArraySize(keys); i++)
         {
