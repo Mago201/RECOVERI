@@ -1,7 +1,17 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.40                                                           |
+//|  v1.41                                                           |
+//|  Добавлено в v1.41:                                              |
+//|    - Защита persistence-state от «застревания» между сменами     |
+//|      режимов: в GV сохраняется отметка MODE; при несовпадении    |
+//|      InpMode с сохранённым — LK_*, PR_PH, RC_TRIG, OEAS_DIS      |
+//|      сбрасываются в дефолты (PAUSED/ESTOP/BE/TSL остаются).      |
+//|    - Кнопка «Reset State» на панели — обнуляет runtime-флаги     |
+//|      (g_lockPhase, g_prPhase, g_recoveryTriggered,               |
+//|      g_otherEAsDisabled, peaks) и стирает соответствующие GV.    |
+//|    - В OnInit() выводится фактический статус загрузки            |
+//|      (clean / loaded / mode-mismatch) для удобства диагностики.  |
 //|  Добавлено в v1.40 ("ULTIMATE"):                                 |
 //|    - Режим MODE_PARTIAL_RECOVERY: лок + усреднители +            |
 //|      ДРОБНОЕ закрытие убыточной позиции (a la AW Recovery).      |
@@ -42,9 +52,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.40"
+#property version   "1.41"
 #property strict
-#property description "Universal MT5 Recovery EA v1.40 - basket + partial recovery"
+#property description "Universal MT5 Recovery EA v1.41 - basket + partial recovery + state-mode guard"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -131,6 +141,15 @@ enum ENUM_DISABLE_EAS
    DISABLE_NONE        = 0,   // 0: Не выключать другие советники
    DISABLE_SAME_SYMBOL = 1,   // 1: Выключить советники на этом символе
    DISABLE_ALL_SYMBOLS = 2    // 2: Выключить советники на всех символах
+  };
+
+// Internal: result of LoadState() for diagnostic logging in OnInit().
+// Not exposed as input.
+enum ENUM_LOAD_STATUS
+  {
+   LS_CLEAN         = 0,      // 0: persistence-storage пуст -> чистый старт
+   LS_LOADED        = 1,      // 1: state совпал по режиму и загружен полностью
+   LS_MODE_MISMATCH = 2       // 2: сохранённый mode != InpMode -> mode-specific keys обнулены
   };
 
 //=== Inputs =========================================================
@@ -334,6 +353,7 @@ string  g_gvPrefix       = "";
 #define BTN_PAUSE        "RECOVERI_BTN_PAUSE"
 #define BTN_LOCK         "RECOVERI_BTN_LOCK"
 #define BTN_RESET        "RECOVERI_BTN_RESET"
+#define BTN_RESET_STATE  "RECOVERI_BTN_RESET_STATE"
 #define BTN_MANUAL_BUY   "RECOVERI_BTN_MANUAL_BUY"
 #define BTN_MANUAL_SELL  "RECOVERI_BTN_MANUAL_SELL"
 
@@ -421,10 +441,16 @@ int OnInit()
       Print("WARNING: InpShowManualButtons=true but InpManualLot<=0; manual buttons will refuse to open.");
    g_gvPrefix = StringFormat("RECOVERI_%s_%I64d_", _Symbol, InpMagic);
    g_baselineBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(InpUsePersistence) LoadState();
+   ENUM_LOAD_STATUS loadStatus = LS_CLEAN;
+   if(InpUsePersistence) loadStatus = LoadState();
+   string lsName = (loadStatus == LS_CLEAN         ? "clean"
+                  : loadStatus == LS_LOADED        ? "loaded"
+                  : "mode-mismatch (mode-specific state cleared)");
+   PrintFormat("RECOVERI init: persistence=%s state=%s mode=%d magic=%I64d",
+               InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.40 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.41 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
    return INIT_SUCCEEDED;
@@ -517,6 +543,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    else if(sparam == BTN_PAUSE)      { g_paused = !g_paused; PrintFormat("BTN: Pause=%s", g_paused?"ON":"OFF"); if(InpUsePersistence) SaveState(); }
    else if(sparam == BTN_LOCK)       { Print("BTN: Lock Now");     ForceLockNow(); }
    else if(sparam == BTN_RESET)      { Print("BTN: Reset Stop");   g_emergencyStop = false; if(InpUsePersistence) SaveState(); }
+   else if(sparam == BTN_RESET_STATE){ Print("BTN: Reset State");  DoResetState(); }
    else if(sparam == BTN_MANUAL_BUY) { Print("BTN: Manual BUY");   DoManualOpen(ORDER_TYPE_BUY); }
    else if(sparam == BTN_MANUAL_SELL){ Print("BTN: Manual SELL");  DoManualOpen(ORDER_TYPE_SELL); }
 
@@ -1801,13 +1828,14 @@ void CreatePanel()
    CreateButton(BTN_CLOSE_SELL, 10+bw+gap,     btnY+bh+gap,      bw, bh, "Close SELL", clrIndianRed, clrWhite);
    CreateButton(BTN_LOCK,       10,            btnY+2*(bh+gap),  bw, bh, "Lock Now",   clrGoldenrod, clrBlack);
    CreateButton(BTN_RESET,      10+bw+gap,     btnY+2*(bh+gap),  bw, bh, "Reset Stop", clrDarkGreen, clrWhite);
+   CreateButton(BTN_RESET_STATE,10+bw+gap,     btnY+3*(bh+gap),  bw, bh, "Reset State",clrDarkSlateBlue, clrWhite);
    if(InpShowManualButtons)
      {
       // Lot label above the manual row
-      CreateLabel("manualLot", 10, btnY+3*(bh+gap)+2);
+      CreateLabel("manualLot", 10, btnY+4*(bh+gap)+2);
       // Manual market open buttons
-      CreateButton(BTN_MANUAL_BUY,  10,        btnY+4*(bh+gap), bw, bh, "BUY (manual)",  clrTeal,      clrWhite);
-      CreateButton(BTN_MANUAL_SELL, 10+bw+gap, btnY+4*(bh+gap), bw, bh, "SELL (manual)", clrDarkOrange, clrWhite);
+      CreateButton(BTN_MANUAL_BUY,  10,        btnY+5*(bh+gap), bw, bh, "BUY (manual)",  clrTeal,      clrWhite);
+      CreateButton(BTN_MANUAL_SELL, 10+bw+gap, btnY+5*(bh+gap), bw, bh, "SELL (manual)", clrDarkOrange, clrWhite);
      }
   }
 
@@ -1843,7 +1871,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.40 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.41 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -2035,6 +2063,7 @@ void VirtualTSLCheck()
 void SaveState()
   {
    if(g_gvPrefix == "") return;
+   GlobalVariableSet(g_gvPrefix + "MODE",    (double)InpMode);
    GlobalVariableSet(g_gvPrefix + "PAUSED",  g_paused        ? 1.0 : 0.0);
    GlobalVariableSet(g_gvPrefix + "ESTOP",   g_emergencyStop ? 1.0 : 0.0);
    GlobalVariableSet(g_gvPrefix + "PEAK_C",  g_peakProfit);
@@ -2068,25 +2097,72 @@ void SaveState()
       GlobalVariableSet(StringFormat("%s%I64u", tslPrefix, g_tslTickets[i]), g_tslPeaks[i]);
   }
 
-void LoadState()
+ENUM_LOAD_STATUS LoadState()
   {
-   if(g_gvPrefix == "") return;
-   if(GlobalVariableCheck(g_gvPrefix + "PAUSED")) g_paused        = (GlobalVariableGet(g_gvPrefix + "PAUSED") > 0.5);
-   if(GlobalVariableCheck(g_gvPrefix + "ESTOP"))  g_emergencyStop = (GlobalVariableGet(g_gvPrefix + "ESTOP")  > 0.5);
-   if(GlobalVariableCheck(g_gvPrefix + "PEAK_C")) g_peakProfit     = GlobalVariableGet(g_gvPrefix + "PEAK_C");
-   if(GlobalVariableCheck(g_gvPrefix + "PEAK_B")) g_peakBuyProfit  = GlobalVariableGet(g_gvPrefix + "PEAK_B");
-   if(GlobalVariableCheck(g_gvPrefix + "PEAK_S")) g_peakSellProfit = GlobalVariableGet(g_gvPrefix + "PEAK_S");
-   if(GlobalVariableCheck(g_gvPrefix + "GRID"))   g_gridPlaced     = (GlobalVariableGet(g_gvPrefix + "GRID")  > 0.5);
-   if(GlobalVariableCheck(g_gvPrefix + "LK_PH"))  g_lockPhase      = (ENUM_LOCK_PHASE)(int)GlobalVariableGet(g_gvPrefix + "LK_PH");
-   if(GlobalVariableCheck(g_gvPrefix + "LK_RS"))  g_remainingSide  = (GlobalVariableGet(g_gvPrefix + "LK_RS") > 0.5) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
-   if(GlobalVariableCheck(g_gvPrefix + "LK_PB"))  g_lockPeakBuy    = GlobalVariableGet(g_gvPrefix + "LK_PB");
-   if(GlobalVariableCheck(g_gvPrefix + "LK_PS"))  g_lockPeakSell   = GlobalVariableGet(g_gvPrefix + "LK_PS");
-   if(GlobalVariableCheck(g_gvPrefix + "LK_RC"))  g_relockCount    = (int)GlobalVariableGet(g_gvPrefix + "LK_RC");
-   if(GlobalVariableCheck(g_gvPrefix + "RC_TRIG"))g_recoveryTriggered = (GlobalVariableGet(g_gvPrefix + "RC_TRIG") > 0.5);
-   if(GlobalVariableCheck(g_gvPrefix + "BASE_BAL"))g_baselineBalance  = GlobalVariableGet(g_gvPrefix + "BASE_BAL");
-   if(GlobalVariableCheck(g_gvPrefix + "OEAS_DIS"))g_otherEAsDisabled = (GlobalVariableGet(g_gvPrefix + "OEAS_DIS") > 0.5);
-   if(GlobalVariableCheck(g_gvPrefix + "PR_PH"))  g_prPhase        = (ENUM_PR_PHASE)(int)GlobalVariableGet(g_gvPrefix + "PR_PH");
+   if(g_gvPrefix == "") return LS_CLEAN;
 
+   // --- Determine origin mode of stored state ---
+   bool modeKnown   = GlobalVariableCheck(g_gvPrefix + "MODE");
+   int  savedMode   = modeKnown ? (int)GlobalVariableGet(g_gvPrefix + "MODE") : -1;
+   bool modeChanged = modeKnown && (savedMode != (int)InpMode);
+
+   // Detect any pre-existing state at all (for clean-vs-legacy distinction)
+   string allKeys[] = {"PAUSED","ESTOP","PEAK_C","PEAK_B","PEAK_S","GRID","BASE_BAL",
+                       "LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
+                       "RC_TRIG","OEAS_DIS","PR_PH"};
+   bool anyState = false;
+   for(int i = 0; i < ArraySize(allKeys); i++)
+      if(GlobalVariableCheck(g_gvPrefix + allKeys[i])) { anyState = true; break; }
+
+   // If MODE marker is missing but state exists, treat as legacy/unknown-mode -> mismatch.
+   bool legacyState   = !modeKnown && anyState;
+   bool ignoreModeKeys = modeChanged || legacyState;
+
+   // --- Always-safe keys: paused/estop/peaks/baseline/grid (mode-agnostic) ---
+   if(GlobalVariableCheck(g_gvPrefix + "PAUSED"))   g_paused          = (GlobalVariableGet(g_gvPrefix + "PAUSED") > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "ESTOP"))    g_emergencyStop   = (GlobalVariableGet(g_gvPrefix + "ESTOP")  > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "PEAK_C"))   g_peakProfit      = GlobalVariableGet(g_gvPrefix + "PEAK_C");
+   if(GlobalVariableCheck(g_gvPrefix + "PEAK_B"))   g_peakBuyProfit   = GlobalVariableGet(g_gvPrefix + "PEAK_B");
+   if(GlobalVariableCheck(g_gvPrefix + "PEAK_S"))   g_peakSellProfit  = GlobalVariableGet(g_gvPrefix + "PEAK_S");
+   if(GlobalVariableCheck(g_gvPrefix + "GRID"))     g_gridPlaced      = (GlobalVariableGet(g_gvPrefix + "GRID")  > 0.5);
+   if(GlobalVariableCheck(g_gvPrefix + "BASE_BAL")) g_baselineBalance = GlobalVariableGet(g_gvPrefix + "BASE_BAL");
+
+   // --- Mode-specific keys: load only if mode matches; otherwise reset to defaults ---
+   if(ignoreModeKeys)
+     {
+      // Wipe stale keys so they don't poison future loads.
+      string staleKeys[] = {"LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
+                            "RC_TRIG","OEAS_DIS","PR_PH"};
+      for(int i = 0; i < ArraySize(staleKeys); i++)
+        {
+         string k = g_gvPrefix + staleKeys[i];
+         if(GlobalVariableCheck(k)) GlobalVariableDel(k);
+        }
+      g_lockPhase         = PHASE_IDLE;
+      g_remainingSide     = POSITION_TYPE_BUY;
+      g_lockPeakBuy       = 0.0;
+      g_lockPeakSell      = 0.0;
+      g_relockCount       = 0;
+      g_recoveryTriggered = false;
+      g_otherEAsDisabled  = false;
+      g_prPhase           = PR_IDLE;
+     }
+   else
+     {
+      if(GlobalVariableCheck(g_gvPrefix + "LK_PH"))   g_lockPhase         = (ENUM_LOCK_PHASE)(int)GlobalVariableGet(g_gvPrefix + "LK_PH");
+      if(GlobalVariableCheck(g_gvPrefix + "LK_RS"))   g_remainingSide     = (GlobalVariableGet(g_gvPrefix + "LK_RS") > 0.5) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+      if(GlobalVariableCheck(g_gvPrefix + "LK_PB"))   g_lockPeakBuy       = GlobalVariableGet(g_gvPrefix + "LK_PB");
+      if(GlobalVariableCheck(g_gvPrefix + "LK_PS"))   g_lockPeakSell      = GlobalVariableGet(g_gvPrefix + "LK_PS");
+      if(GlobalVariableCheck(g_gvPrefix + "LK_RC"))   g_relockCount       = (int)GlobalVariableGet(g_gvPrefix + "LK_RC");
+      if(GlobalVariableCheck(g_gvPrefix + "RC_TRIG")) g_recoveryTriggered = (GlobalVariableGet(g_gvPrefix + "RC_TRIG") > 0.5);
+      if(GlobalVariableCheck(g_gvPrefix + "OEAS_DIS"))g_otherEAsDisabled  = (GlobalVariableGet(g_gvPrefix + "OEAS_DIS") > 0.5);
+      if(GlobalVariableCheck(g_gvPrefix + "PR_PH"))   g_prPhase           = (ENUM_PR_PHASE)(int)GlobalVariableGet(g_gvPrefix + "PR_PH");
+     }
+
+   // Stamp current mode for the next load (always, including LS_CLEAN -> first run).
+   GlobalVariableSet(g_gvPrefix + "MODE", (double)InpMode);
+
+   // --- BE / TSL ticket markers (mode-agnostic, always loaded) ---
    ArrayResize(g_beTickets, 0);
    ArrayResize(g_tslTickets, 0);
    ArrayResize(g_tslPeaks, 0);
@@ -2100,11 +2176,13 @@ void LoadState()
       else if(StringFind(n, "RECOVERI_TSL_") == 0)
         { ticket = (ulong)StringToInteger(StringSubstr(n, 13)); if(PositionSelectByTicket(ticket)) TslSet(ticket, GlobalVariableGet(n)); }
      }
-   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d trig=%d prPhase=%d",
+
+   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d trig=%d prPhase=%d savedMode=%d curMode=%d",
                g_paused, g_emergencyStop, g_peakProfit, g_peakBuyProfit, g_peakSellProfit,
                ArraySize(g_beTickets), ArraySize(g_tslTickets),
                (int)g_lockPhase, (int)g_remainingSide, g_relockCount,
-               (int)g_recoveryTriggered, (int)g_prPhase);
+               (int)g_recoveryTriggered, (int)g_prPhase,
+               savedMode, (int)InpMode);
 
    //--- Recompute partial-recovery averager counts from open positions ---
    g_prAvgCountBuy = 0;
@@ -2120,6 +2198,55 @@ void LoadState()
      }
    if(g_prAvgCountBuy + g_prAvgCountSell > 0)
       PrintFormat("PR averagers reconstructed: BUY=%d SELL=%d", g_prAvgCountBuy, g_prAvgCountSell);
+
+   // --- Decide return status ---
+   if(!modeKnown && !anyState) return LS_CLEAN;
+   if(ignoreModeKeys)          return LS_MODE_MISMATCH;
+   return LS_LOADED;
+  }
+
+//+------------------------------------------------------------------+
+//| Reset all runtime flags + erase corresponding GVs.               |
+//| Triggered by the "Reset State" panel button or callable from     |
+//| code. Keeps PAUSED, ESTOP, BE/TSL markers intact.                |
+//+------------------------------------------------------------------+
+void DoResetState()
+  {
+   // Runtime flags -> defaults
+   g_lockPhase         = PHASE_IDLE;
+   g_remainingSide     = POSITION_TYPE_BUY;
+   g_lockPeakBuy       = 0.0;
+   g_lockPeakSell      = 0.0;
+   g_relockCount       = 0;
+   g_prPhase           = PR_IDLE;
+   g_prAvgCountBuy     = 0;
+   g_prAvgCountSell    = 0;
+   g_prLastBarTime     = 0;
+   g_prLastBarTimeS    = 0;
+   g_recoveryTriggered = false;
+   g_otherEAsDisabled  = false;
+   g_peakProfit        = 0.0;
+   g_peakBuyProfit     = 0.0;
+   g_peakSellProfit    = 0.0;
+
+   // GVs -> erase the same set
+   if(g_gvPrefix != "")
+     {
+      string keys[] = {"LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
+                       "RC_TRIG","OEAS_DIS","PR_PH",
+                       "PEAK_C","PEAK_B","PEAK_S"};
+      for(int i = 0; i < ArraySize(keys); i++)
+        {
+         string k = g_gvPrefix + keys[i];
+         if(GlobalVariableCheck(k)) GlobalVariableDel(k);
+        }
+     }
+
+   // Re-stamp current mode and persist clean state
+   if(InpUsePersistence) SaveState();
+
+   Print("RECOVERI: Reset State - runtime flags cleared (paused/estop/BE/TSL kept).");
+   Notify("RECOVERI: state reset (runtime flags cleared)");
   }
 
 
