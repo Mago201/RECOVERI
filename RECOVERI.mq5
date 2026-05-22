@@ -271,6 +271,9 @@ input bool               InpShowPanel     = true;                // Показы
 input color              InpPanelColor    = clrWhite;            // Цвет текста панели
 input int                InpPanelFontSize = 10;                  // Размер шрифта панели
 
+input group "=== Диагностика ==="
+input bool               InpDebugManaged  = false;               // Логировать каждые 10 сек, какие позиции попали в корзину и почему
+
 //=== Globals ========================================================
 CTrade         trade;
 CPositionInfo  pos;
@@ -327,6 +330,9 @@ int           g_prAvgCountSell= 0;
 
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
+
+// Diagnostics: throttle for debug dump
+datetime g_lastDebugDump = 0;
 
 #define BTN_CLOSE_ALL    "RECOVERI_BTN_CLOSE_ALL"
 #define BTN_CLOSE_BUY    "RECOVERI_BTN_CLOSE_BUY"
@@ -427,6 +433,7 @@ int OnInit()
    PrintFormat("RECOVERI v1.40 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
+   if(InpDebugManaged) DebugDumpPositions(true);
    return INIT_SUCCEEDED;
   }
 
@@ -475,6 +482,7 @@ void OnTick()
 
    BasketState bs;
    BuildBasket(bs);
+   if(InpDebugManaged) DebugDumpPositions();
    ApplyBasketTrailing(bs);
 
    if(bs.count > 0 && CheckBasketTargets(bs))
@@ -522,6 +530,50 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 
    ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
    ChartRedraw(0);
+  }
+
+//+------------------------------------------------------------------+
+//| Diagnostic: dump every position on the account and explain       |
+//| whether IsManaged() picks it up. Throttled to once per 10s.      |
+//+------------------------------------------------------------------+
+void DebugDumpPositions(const bool force = false)
+  {
+   if(!InpDebugManaged && !force) return;
+   datetime now = TimeCurrent();
+   if(!force && now - g_lastDebugDump < 10) return;
+   g_lastDebugDump = now;
+
+   int total = PositionsTotal();
+   PrintFormat("DBG dump: PositionsTotal=%d, _Symbol=%s, ManageScope=%d, SymbolScope=%d, Magic=%I64d",
+               total, _Symbol, (int)InpManageScope, (int)InpSymbolScope, InpMagic);
+   if(total == 0)
+     {
+      Print("  (no open positions on the account)");
+      return;
+     }
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!pos.SelectByTicket(t))
+        {
+         PrintFormat("  #%I64u: SelectByTicket failed", t);
+         continue;
+        }
+      string posSym = pos.Symbol();
+      long   m      = pos.Magic();
+      string typ    = (pos.PositionType() == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+      double vol    = pos.Volume();
+      double pft    = pos.Profit() + pos.Swap() + pos.Commission();
+      string verdict = "MANAGED";
+      if(InpSymbolScope == SCOPE_CURRENT && posSym != _Symbol)
+         verdict = StringFormat("SKIP (symbol '%s' != '%s')", posSym, _Symbol);
+      else if(InpManageScope == MANAGE_MANUAL && m != 0)
+         verdict = StringFormat("SKIP (MANAGE_MANUAL: magic=%I64d != 0)", m);
+      else if(InpManageScope == MANAGE_OWN && m != InpMagic)
+         verdict = StringFormat("SKIP (MANAGE_OWN: magic=%I64d != %I64d)", m, InpMagic);
+      PrintFormat("  #%I64u sym='%s' magic=%I64d %s %.2f P/L=%.2f -> %s",
+                  t, posSym, m, typ, vol, pft, verdict);
+     }
   }
 
 //+------------------------------------------------------------------+
@@ -1295,7 +1347,7 @@ void DisableOtherEAs()
                         (InpDisableOtherEAs == DISABLE_SAME_SYMBOL && sameSym);
          if(inScope)
            {
-            string ename = ChartGetString(cid, CHARTPROPERTY_EXPERT_NAME);
+            string ename = ChartGetString(cid, CHART_EXPERT_NAME);
             if(ename != "" && ename != MQLInfoString(MQL_PROGRAM_NAME))
               {
                list += StringFormat("%s[%s] ", sym2, ename);
