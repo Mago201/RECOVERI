@@ -1,7 +1,32 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.41                                                           |
+//|  v1.43                                                           |
+//|  Добавлено в v1.43 (Mode 5 / PartialRecovery):                  |
+//|    - Фикс: суммарный итог цикла "averager TP + chip от лока"    |
+//|      больше не уходит в минус. AffordableChipLot() ограничивает |
+//|      лот чипа так, чтобы реализованный убыток не превышал       |
+//|      прибыль закрытого усреднителя. Если даже минимальный лот   |
+//|      не помещается в бюджет — чип пропускается и пишется в лог  |
+//|      (попробуем на следующем TP усреднителя). Прибыль           |
+//|      усреднителя фиксируется ДО PositionClose, чтобы корректно  |
+//|      посчитать бюджет.                                          |
+//|    - Фикс: при смене тренда сетка теперь меняет направление.    |
+//|      Раньше InpUseTrendFilter работал только как veto -         |
+//|      блокировал усреднители против тренда, но не запускал в     |
+//|      новую сторону при развороте. Теперь, если тренд-фильтр     |
+//|      включён и есть направление: BUY-усреднители при trend>0,   |
+//|      SELL-усреднители при trend<0 (без оглядки на текущую       |
+//|      убыточную сторону). При нейтральном тренде — старая        |
+//|      эвристика по убыточной стороне.                            |
+//|  Добавлено в v1.42:                                              |
+//|    - Фикс: кнопки панели (BUY/SELL manual, Close All и др.) не   |
+//|      реагировали в Strategy Tester. В MT5 визуальном тестере     |
+//|      OnChartEvent доставляет CHARTEVENT_OBJECT_CLICK ненадёжно.  |
+//|      Добавлен PollPanelButtons() — опрос OBJPROP_STATE кнопок    |
+//|      каждый тик; если кнопка нажата, диспетчеризуем обработчик   |
+//|      через общий HandlePanelClick(). Активно ТОЛЬКО в тестере    |
+//|      (MQL_TESTER=true), в live торговле поведение неизменно.    |
 //|  Добавлено в v1.41:                                              |
 //|    - Защита persistence-state от «застревания» между сменами     |
 //|      режимов: в GV сохраняется отметка MODE; при несовпадении    |
@@ -52,9 +77,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.41"
+#property version   "1.43"
 #property strict
-#property description "Universal MT5 Recovery EA v1.41 - basket + partial recovery + state-mode guard"
+#property description "Universal MT5 Recovery EA v1.43 - basket + partial recovery (net-positive chip + trend-driven grid)"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -450,7 +475,7 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.41 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.43 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
    return INIT_SUCCEEDED;
@@ -1424,6 +1449,46 @@ bool HasLosingOriginalPositions()
   }
 
 //+------------------------------------------------------------------+
+//| Largest chip lot from `losingTicket` whose realized loss at the   |
+//| current price stays within `budgetMoney` (== closed averager P/L).|
+//|                                                                   |
+//| Returns 0 if even minLot would exceed the budget => caller should |
+//| skip the chip this round (and log it). Returns the requested lot  |
+//| when the position is at break-even / profit (no cap needed).      |
+//+------------------------------------------------------------------+
+double AffordableChipLot(const ulong losingTicket, const double budgetMoney, const double requestedLot)
+  {
+   if(budgetMoney <= 0) return 0;
+   if(requestedLot <= 0) return 0;
+   if(!pos.SelectByTicket(losingTicket)) return 0;
+   double posProfit = pos.Profit() + pos.Swap() + pos.Commission();
+   double posVol    = pos.Volume();
+   if(posVol <= 0) return 0;
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+
+   double cap = MathMin(requestedLot, posVol);
+
+   // Position currently at break-even / in profit -> chipping realises no loss
+   if(posProfit >= 0)
+     {
+      double v0 = MathFloor(cap / step + 1e-7) * step;
+      if(v0 < minLot) return 0;
+      return NormalizeDouble(v0, 2);
+     }
+
+   // Linear approximation: realised loss(chip) = |posProfit| * (chip / posVol).
+   // Solve for max chip that keeps realised loss <= budgetMoney.
+   double maxLot = budgetMoney * posVol / (-posProfit);
+   double chipLot = MathMin(cap, maxLot);
+   double v = MathFloor(chipLot / step + 1e-7) * step;
+   if(v < minLot) return 0;
+   return NormalizeDouble(v, 2);
+  }
+
+//+------------------------------------------------------------------+
 //| Pick the next losing-side ticket to chip away at, by priority.   |
 //|   side=BUY  => the worst BUY we own                              |
 //|   side=SELL => the worst SELL we own                             |
@@ -1610,18 +1675,20 @@ void DoPartialRecovery(const BasketState &bs)
       wantBuy  = true;
       wantSell = true;
      }
+   else if(InpUseTrendFilter && trend != 0)
+     {
+      // Trend filter is active and has a direction:
+      // align averagers with the trend instead of just using it as a veto.
+      // This way a trend reversal automatically switches the grid side
+      // (BUY averagers when trend up, SELL averagers when trend down).
+      wantBuy  = (trend > 0);
+      wantSell = (trend < 0);
+     }
    else
      {
-      // open averager opposite to the heavier losing side
+      // Default heuristic: open averager opposite to the heavier-losing side
       if(bs.sellProfit < bs.buyProfit) wantBuy  = true;  // SELL hurts more, push price up via BUY
       else                              wantSell = true;
-     }
-
-   // Apply trend filter
-   if(InpUseTrendFilter && trend != 0)
-     {
-      if(trend < 0) wantBuy  = false;
-      if(trend > 0) wantSell = false;
      }
 
    // BUY averager
@@ -1684,8 +1751,10 @@ double LastAveragerPrice(const ENUM_POSITION_TYPE side, const string tag)
   }
 
 //+------------------------------------------------------------------+
-//| For each profitable averager: close it, then chip InpPartCloseLot |
-//| off the worst losing position on the OPPOSITE side.               |
+//| For each profitable averager: close it, then chip a piece off the |
+//| worst losing position on the OPPOSITE side. Chip lot is capped so |
+//| (averager profit + chip realised loss) >= 0 -> recovery never goes |
+//| net-negative on a single TP cycle.                                |
 //+------------------------------------------------------------------+
 void ProcessProfitableAveragers(const BasketState &bs)
   {
@@ -1694,7 +1763,10 @@ void ProcessProfitableAveragers(const BasketState &bs)
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-   ulong tickets[];
+   // Capture tickets + their floating P/L while the averager is still open;
+   // we need the realised profit value for budgeting the chip below.
+   ulong  tickets[];
+   double avgProfits[];
    int total = PositionsTotal();
    for(int i = 0; i < total; i++)
      {
@@ -1706,19 +1778,25 @@ void ProcessProfitableAveragers(const BasketState &bs)
       ENUM_POSITION_TYPE pt2 = pos.PositionType();
       double pts = (pt2 == POSITION_TYPE_BUY) ? (bid - op)/pt : (op - ask)/pt;
       if(pts < InpAvgTPpts) continue;
-      int n = ArraySize(tickets); ArrayResize(tickets, n+1); tickets[n] = t;
+      double profitMoney = pos.Profit() + pos.Swap() + pos.Commission();
+      int n = ArraySize(tickets);
+      ArrayResize(tickets,    n+1);
+      ArrayResize(avgProfits, n+1);
+      tickets[n]    = t;
+      avgProfits[n] = profitMoney;
      }
 
    for(int i = 0; i < ArraySize(tickets); i++)
      {
       if(!pos.SelectByTicket(tickets[i])) continue;
       ENUM_POSITION_TYPE avgSide = pos.PositionType();
-      double avgVol = pos.Volume();
+      double avgVol    = pos.Volume();
+      double avgProfit = avgProfits[i];
 
       // Close the averager
       if(!trade.PositionClose(tickets[i], (ulong)InpSlippage)) continue;
-      PrintFormat("PR: closed averager #%I64u (%s %.2f)", tickets[i],
-                  avgSide==POSITION_TYPE_BUY?"BUY":"SELL", avgVol);
+      PrintFormat("PR: closed averager #%I64u (%s %.2f, profit=%.2f)", tickets[i],
+                  avgSide==POSITION_TYPE_BUY?"BUY":"SELL", avgVol, avgProfit);
       if(avgSide == POSITION_TYPE_BUY) g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy-1);
       else                              g_prAvgCountSell = MathMax(0, g_prAvgCountSell-1);
 
@@ -1731,16 +1809,25 @@ void ProcessProfitableAveragers(const BasketState &bs)
          // Try same side (case where averager was opened against the bigger loss)
          target = PickLosingTicket(avgSide);
         }
-      if(target != 0)
-        {
-         if(ClosePartOfPosition(target, InpPartCloseLot))
-            PrintFormat("PR: chipped %.2f from loser #%I64u (priority=%d)",
-                        InpPartCloseLot, target, (int)InpRecoveryPriority);
-        }
-      else
+      if(target == 0)
         {
          PrintFormat("PR: no losing tickets to chip; recovery may be near completion");
+         continue;
         }
+
+      // Cap chip lot so the cycle (averager close + chip close) is net non-negative.
+      double chipLot = AffordableChipLot(target, avgProfit, InpPartCloseLot);
+      if(chipLot <= 0)
+        {
+         PrintFormat("PR: skip chip on #%I64u - averager profit %.2f too small vs current loss "
+                     "(would push cycle net-negative). Letting drawdown ride; will retry on next averager TP.",
+                     target, avgProfit);
+         continue;
+        }
+      if(ClosePartOfPosition(target, chipLot))
+         PrintFormat("PR: chipped %.2f from loser #%I64u (priority=%d, budget=%.2f%s)",
+                     chipLot, target, (int)InpRecoveryPriority, avgProfit,
+                     chipLot < InpPartCloseLot ? " - capped" : "");
      }
   }
 
@@ -1871,7 +1958,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.41 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.43 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
