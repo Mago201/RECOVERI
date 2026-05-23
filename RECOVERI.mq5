@@ -1,7 +1,24 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.44                                                           |
+//|  v1.45                                                           |
+//|  Добавлено в v1.45 (Безусловная сетка — общий ТП):               |
+//|    - В режиме `InpUseUncondGrid`, после того как сработало       |
+//|      InpGridCommonTPCount уровней (по умолчанию 5), у сетки      |
+//|      активируется ОБЩИЙ ТП на всю корзину. Считается             |
+//|      средневзвешенная цена открытия отдельно по BUY-ордерам и    |
+//|      SELL-ордерам сетки и нужный таргет:                         |
+//|        BUY  : закрыть все, когда Bid >= WAvgBuy  + InpGridCommonTPPts |
+//|        SELL : закрыть все, когда Ask <= WAvgSell - InpGridCommonTPPts |
+//|      Дополнительно работает денежный триггер                     |
+//|      InpGridCommonTPMoney (валюта депо, 0=выкл): когда суммарный |
+//|      PnL всех сеточных позиций пересекает порог — закрытие       |
+//|      всей корзины сетки одним проходом. Управляется ключами      |
+//|      InpGridCommonTPCount, InpGridCommonTPPts,                   |
+//|      InpGridCommonTPMoney в группе «Безусловная сетка».          |
+//|      Идентификация позиций сетки: magic == InpMagic + comment    |
+//|      содержит "GRID-" (включая GRID-R от ReplenishGrid). Прочие  |
+//|      позиции (ручные, AVG, LOCK) не трогаются.                   |
 //|  Добавлено в v1.44 (Mode 5 — Partial Recovery):                  |
 //|    - Закрытие старой сетки усреднителей по профиту при смене     |
 //|      тренда. До 1.43 при флипе тренда счётчик усреднителей       |
@@ -98,9 +115,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.44"
+#property version   "1.45"
 #property strict
-#property description "Universal MT5 Recovery EA v1.44 - Mode5 close old PR-AVG grid by profit on trend flip"
+#property description "Universal MT5 Recovery EA v1.45 - Common TP for unconditional grid after N filled levels"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -331,6 +348,9 @@ input int                InpGridStepPoints    = 200;             // Шаг ме�
 input double             InpGridStartLot      = 0.01;            // Лот первого уровня
 input double             InpGridLotMultiplier = 1.0;             // Множитель лота (1.0 = одинаковый, >1 = мартингейл)
 input bool               InpGridReplaceFilled = false;           // Переоткрывать сработавшие уровни
+input int                InpGridCommonTPCount = 5;               // Кол-во сработавших ордеров сетки для активации общего ТП (0=выкл)
+input int                InpGridCommonTPPts   = 50;              // Общий ТП от средневзв. цены сетки (пункты, на сторону; 0=выкл)
+input double             InpGridCommonTPMoney = 0.0;             // Общий ТП по сумме PnL всей сетки (валюта депо; 0=выкл)
 
 input group "=== Ручная торговля (тестер/график) ==="
 input bool               InpShowManualButtons = true;            // Показывать кнопки ручного открытия BUY/SELL
@@ -431,6 +451,19 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
 
+   if(InpUseUncondGrid)
+     {
+      if(InpGridCommonTPCount < 0)
+        { Print("InpGridCommonTPCount must be >= 0");  return INIT_PARAMETERS_INCORRECT; }
+      if(InpGridCommonTPPts   < 0)
+        { Print("InpGridCommonTPPts must be >= 0");    return INIT_PARAMETERS_INCORRECT; }
+      if(InpGridCommonTPMoney < 0)
+        { Print("InpGridCommonTPMoney must be >= 0");  return INIT_PARAMETERS_INCORRECT; }
+      if(InpGridCommonTPCount > 0 && InpGridCommonTPPts <= 0 && InpGridCommonTPMoney <= 0)
+         Print("WARNING: InpGridCommonTPCount=", InpGridCommonTPCount,
+               " set, but both InpGridCommonTPPts and InpGridCommonTPMoney are 0. Common grid TP is effectively disabled.");
+     }
+
    if(InpMode == MODE_PARTIAL_RECOVERY)
      {
       if(InpPartCloseLot <= 0)
@@ -518,7 +551,7 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.44 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.45 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
    if(InpDebugManaged) DebugDumpPositions(true);
@@ -571,6 +604,12 @@ void OnTick()
 
    if(InpUseUncondGrid && InpGridReplaceFilled)
       ReplenishGrid();
+
+   // v1.45: Common TP for the unconditional grid once N+ levels are filled.
+   // Runs before BuildBasket so the basket reflects the closures immediately.
+   if(InpUseUncondGrid && InpGridCommonTPCount > 0
+      && (InpGridCommonTPPts > 0 || InpGridCommonTPMoney > 0))
+      CheckGridCommonTP();
 
 
    BasketState bs;
@@ -2218,7 +2257,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.43 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.45 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -2702,6 +2741,137 @@ void ReplenishGrid()
          trade.BuyLimit(lot,  NormalizeDouble(ask - off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-B");
       if(i <= needS)
          trade.SellLimit(lot, NormalizeDouble(bid + off, _Digits), _Symbol, 0, 0, ORDER_TIME_GTC, 0, cmt+"-S");
+     }
+  }
+//+------------------------------------------------------------------+
+
+
+//+------------------------------------------------------------------+
+//| Common TP for the unconditional grid (v1.45).                    |
+//|   - Identifies grid-triggered positions by magic == InpMagic     |
+//|     and a comment substring "GRID-" (covers both initial         |
+//|     PlaceUnconditionalGrid tags "GRID-N-B/S" and ReplenishGrid   |
+//|     tags "GRID-RN-B/S"). Manual / averagers / lock positions     |
+//|     are not touched.                                             |
+//|   - Once total grid positions >= InpGridCommonTPCount, evaluates |
+//|     two independent triggers:                                    |
+//|       * money: sum(PnL) >= InpGridCommonTPMoney -> close ALL     |
+//|         grid positions (both sides) at once.                     |
+//|       * price: per-side weighted-average open price + offset:    |
+//|           BUY  side closed when Bid >= WAvgBuy  + TPpts*Point    |
+//|           SELL side closed when Ask <= WAvgSell - TPpts*Point    |
+//|     Money trigger has priority; if not hit, price triggers fire  |
+//|     per side independently.                                      |
+//+------------------------------------------------------------------+
+bool IsGridPosition(const ulong ticket)
+  {
+   if(!pos.SelectByTicket(ticket)) return false;
+   if(InpSymbolScope == SCOPE_CURRENT && pos.Symbol() != _Symbol) return false;
+   if((long)pos.Magic() != InpMagic) return false;
+   string c = pos.Comment();
+   return (StringFind(c, "GRID-") >= 0);
+  }
+
+void CloseAllGridPositions(const string reason)
+  {
+   ulong tickets[];
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsGridPosition(t)) continue;
+      int n = ArraySize(tickets); ArrayResize(tickets, n + 1); tickets[n] = t;
+     }
+   for(int i = 0; i < ArraySize(tickets); i++)
+      if(!trade.PositionClose(tickets[i], (ulong)InpSlippage))
+         PrintFormat("Grid common-TP close #%I64u err=%d (%s)",
+                     tickets[i], trade.ResultRetcode(), reason);
+  }
+
+void CheckGridCommonTP()
+  {
+   ulong  buyT[], sellT[];
+   double buyVol = 0,  sellVol = 0;
+   double buyPV  = 0,  sellPV  = 0;
+   double totalPnL = 0;
+   int    totalGrid = 0;
+
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsGridPosition(t)) continue;
+      double v   = pos.Volume();
+      double prc = pos.PriceOpen();
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      totalGrid++;
+      totalPnL += pft;
+      if(pos.PositionType() == POSITION_TYPE_BUY)
+        {
+         buyVol += v; buyPV += prc * v;
+         int n = ArraySize(buyT); ArrayResize(buyT, n + 1); buyT[n] = t;
+        }
+      else if(pos.PositionType() == POSITION_TYPE_SELL)
+        {
+         sellVol += v; sellPV += prc * v;
+         int n = ArraySize(sellT); ArrayResize(sellT, n + 1); sellT[n] = t;
+        }
+     }
+
+   if(totalGrid < InpGridCommonTPCount) return;
+
+   // 1) Money-based trigger: closes the whole grid basket at once.
+   if(InpGridCommonTPMoney > 0 && totalPnL >= InpGridCommonTPMoney)
+     {
+      PrintFormat("Grid common TP $: count=%d pnl=%.2f >= %.2f -> close grid",
+                  totalGrid, totalPnL, InpGridCommonTPMoney);
+      Notify(StringFormat("Grid common TP $ hit: %.2f >= %.2f, closing %d grid positions",
+                          totalPnL, InpGridCommonTPMoney, totalGrid));
+      CloseAllGridPositions("money");
+      return;
+     }
+
+   // 2) Price-based per-side trigger: WAvg + TPpts.
+   if(InpGridCommonTPPts <= 0) return;
+
+   sym.Name(_Symbol); sym.RefreshRates();
+   double pt  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double bid = sym.Bid();
+   double ask = sym.Ask();
+   if(pt <= 0 || bid <= 0 || ask <= 0) return;
+
+   if(buyVol > 0 && ArraySize(buyT) > 0)
+     {
+      double wavg   = buyPV / buyVol;
+      double target = NormalizeDouble(wavg + InpGridCommonTPPts * pt, _Digits);
+      if(bid >= target)
+        {
+         PrintFormat("Grid common TP BUY: %d positions, WAvg=%.5f tgt=%.5f bid=%.5f",
+                     ArraySize(buyT), wavg, target, bid);
+         Notify(StringFormat("Grid common TP BUY hit: %d positions @ %.5f (WAvg=%.5f +%dpts)",
+                             ArraySize(buyT), bid, wavg, InpGridCommonTPPts));
+         for(int i = 0; i < ArraySize(buyT); i++)
+            if(!trade.PositionClose(buyT[i], (ulong)InpSlippage))
+               PrintFormat("Grid common-TP close BUY #%I64u err=%d",
+                           buyT[i], trade.ResultRetcode());
+        }
+     }
+
+   if(sellVol > 0 && ArraySize(sellT) > 0)
+     {
+      double wavg   = sellPV / sellVol;
+      double target = NormalizeDouble(wavg - InpGridCommonTPPts * pt, _Digits);
+      if(ask <= target)
+        {
+         PrintFormat("Grid common TP SELL: %d positions, WAvg=%.5f tgt=%.5f ask=%.5f",
+                     ArraySize(sellT), wavg, target, ask);
+         Notify(StringFormat("Grid common TP SELL hit: %d positions @ %.5f (WAvg=%.5f -%dpts)",
+                             ArraySize(sellT), ask, wavg, InpGridCommonTPPts));
+         for(int i = 0; i < ArraySize(sellT); i++)
+            if(!trade.PositionClose(sellT[i], (ulong)InpSlippage))
+               PrintFormat("Grid common-TP close SELL #%I64u err=%d",
+                           sellT[i], trade.ResultRetcode());
+        }
      }
   }
 //+------------------------------------------------------------------+
