@@ -1,7 +1,30 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.50                                                           |
+//|  v1.51                                                           |
+//|  Добавлено в v1.51 (фикс Mode 5 — trend-flip trim):              |
+//|    - Исправлен баг: при смене тренда советник закрывал           |
+//|      локирующий ордер целиком (или гораздо больше, чем нужно),   |
+//|      потому что TrimStrongSideToWeak() считал имбаланс ПО ВСЕМ   |
+//|      managed-позициям (PR-AVG, PR-LOCK, оригиналы) и сортировал  |
+//|      срезаемую сторону по PnL DESC. Лок обычно имеет наибольший  |
+//|      абсолютный PnL (он крупнее по объёму), поэтому попадал      |
+//|      первым в очередь на закрытие, и забирал на себя весь diff,  |
+//|      включая объём ещё открытых усреднителей. В результате лок   |
+//|      срезался не на величину чипа от убыточника, а на «BUY−SELL  |
+//|      по всем группам».                                           |
+//|    - Теперь trim работает прицельно: считает объём LOCK на одной |
+//|      стороне и объём ОРИГИНАЛЬНЫХ (не-PR-*) позиций на           |
+//|      противоположной стороне, и режет ИМЕННО лок до объёма       |
+//|      оставшегося оригинала. Усреднители (PR-AVG-*) и позиции на  |
+//|      той же стороне, что и лок, в расчёте не участвуют и trim-ом |
+//|      не трогаются — они продолжают закрываться обычным путём     |
+//|      (TP усреднителя + чип убыточника, либо InpCloseOldGridOn-   |
+//|      TrendFlip по корзинному профиту). Пример: SELL 1.0 → 0.8    |
+//|      после чипа, лок BUY 1.0; на флипе лок BUY режется на 0.2 →  |
+//|      остаётся SELL 0.80 / lock BUY 0.80, усреднители целы.       |
+//|    - Если лока нет (или он на обеих сторонах в каких-то          |
+//|      нештатных конфигурациях) — trim ничего не делает.           |
 //|  Добавлено в v1.50 (Mode 5 — Partial Recovery):                  |
 //|    - Опциональное выравнивание объёмов на смене тренда:          |
 //|      InpTrendFlipTrimStrong (по умолчанию false). Когда флипнул  |
@@ -116,9 +139,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.50"
+#property version   "1.51"
 #property strict
-#property description "Universal MT5 Recovery EA v1.50 - Mode5 trend-flip optional trim of strong side to weak"
+#property description "Universal MT5 Recovery EA v1.51 - Mode5 trend-flip trim now targets only the LOCK"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -296,7 +319,7 @@ input double             InpMinNetProfitPct   = 0.0;                 // Mode5: �
 input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
 input bool               InpCloseOldGridOnTrendFlip = true;          // Mode5: при смене тренда закрывать старую сетку усреднителей по профиту корзинно
 input double             InpOldGridCloseProfit     = 0.0;            // Mode5: мин. суммарный профит старой сетки для её закрытия (валюта депо, >=0)
-input bool               InpTrendFlipTrimStrong    = false;          // Mode5: при смене тренда выравнивать сильную сторону под слабую (закрывает позиции с наибольшим PnL первыми, по всем managed-группам)
+input bool               InpTrendFlipTrimStrong    = false;          // Mode5: при смене тренда срезать лок до объёма противоположного оригинала (PR-AVG не трогаются)
 
 input group "=== Тренд-фильтр для усреднителей ==="
 input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
@@ -1769,10 +1792,13 @@ void DoPartialRecovery(const BasketState &bs)
                              g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"));
         }
 
-      // v1.50: optional one-shot trim of the heavier side down to the
-      // lighter side across ALL managed groups (PR-AVG, PR-LOCK,
-      // originals, AVG-*, GRID-*).  Closes most-profitable positions
-      // first.  Runs independently of the two flags above.
+      // v1.51: одноразовый trim ИМЕННО ЛОКА на смене тренда.
+      // Считает lockVol на одной стороне и origVol (managed-позиции
+      // без тегов PR-AVG/PR-LOCK) на противоположной, режет лок до
+      // объёма противоположного оригинала. Усреднители (PR-AVG-*)
+      // и однонаправленные с локом оригиналы НЕ учитываются и НЕ
+      // закрываются — для них работают InpRestartGridOnTrendFlip и
+      // InpCloseOldGridOnTrendFlip.
       if(InpTrendFlipTrimStrong)
          TrimStrongSideToWeak();
 
@@ -1939,8 +1965,9 @@ void TryCloseOldGridByProfit()
 //| Sum total volume of ALL managed positions, separately for each   |
 //| direction.  Counts every group the EA considers managed: PR-AVG, |
 //| PR-LOCK, originals (no PR-* tag), AVG-*, GRID-*, MANUAL-LOCK,    |
-//| etc.  Used by TrimStrongSideToWeak to decide how much volume to  |
-//| trim off the heavier side at trend-flip time.                    |
+//| etc.  Generic helper kept for diagnostics / future use.           |
+//| Note: v1.51 trim no longer uses this — TrimStrongSideToWeak now  |
+//| computes lockVol / origVol separately and only trims the LOCK.   |
 //+------------------------------------------------------------------+
 void ComputeManagedNetVolumes(double &buyVol, double &sellVol)
   {
@@ -1958,45 +1985,120 @@ void ComputeManagedNetVolumes(double &buyVol, double &sellVol)
   }
 
 //+------------------------------------------------------------------+
-//| TrimStrongSideToWeak (v1.50).                                     |
+//| TrimStrongSideToWeak (v1.51 - lock-targeted).                    |
 //| Called once at trend-flip time when InpTrendFlipTrimStrong=true. |
-//| Determines the heavier side across ALL managed groups and closes |
-//| (fully or partially) positions on that side -- starting with the |
-//| most-profitable -- until the heavier side matches the lighter   |
-//| side in volume.  Coexists with InpRestartGridOnTrendFlip and    |
-//| InpCloseOldGridOnTrendFlip; trim is one-shot, the other flags   |
-//| keep operating on whatever PR-AVG-* survives.                    |
 //|                                                                  |
-//| Notes:                                                           |
-//|   * Sorts strong-side tickets by (Profit+Swap+Commission) DESC,  |
-//|     so winners are realised first.  Negative-PnL positions are   |
-//|     only touched if winners alone aren't enough to cover diff.  |
-//|   * The last position is partial-closed via ClosePartOfPosition  |
-//|     to land exactly on the matching volume.                      |
-//|   * After the trim we rescan PositionsTotal() to recompute       |
-//|     g_prAvgCount{Buy,Sell} (the trim may have closed PR-AVG-*    |
-//|     entries) and persist if InpUsePersistence is on.             |
+//| Прежняя реализация (v1.50) суммировала объёмы ВСЕХ managed-      |
+//| позиций по сторонам и закрывала «сильную» сторону до «слабой»,   |
+//| сортируя по PnL DESC. У лока обычно наибольший абсолютный PnL    |
+//| (крупный объём), поэтому он попадал первым в очередь и забирал   |
+//| весь diff на себя — включая объём открытых усреднителей. В       |
+//| итоге пользователь видел, что лок закрывается полностью или      |
+//| гораздо сильнее, чем ожидалось.                                  |
+//|                                                                  |
+//| Новая логика: считаем строго                                     |
+//|   * lockVolBuy  / lockVolSell  — суммарный объём PR-LOCK по сторонам|
+//|   * origVolBuy  / origVolSell  — суммарный объём «оригиналов»    |
+//|     (managed-позиции БЕЗ тегов PR-AVG / PR-LOCK)                 |
+//| и режем именно LOCK на стороне, где он есть, до объёма оригинала |
+//| на противоположной стороне. Усреднители и однонаправленные с     |
+//| локом оригиналы в расчёте не участвуют и trim-ом не трогаются.   |
+//|                                                                  |
+//| Пример пользователя:                                             |
+//|   SELL original 1.0 → чип 0.2 → 0.8                               |
+//|   PR-LOCK BUY 1.0                                                |
+//|   trend flip → diff = lockBuy(1.0) − origSell(0.8) = 0.2          |
+//|   LOCK BUY режется на 0.2 → 0.8                                  |
+//|   итог: SELL 0.80 / lock BUY 0.80, усреднители (если ещё открыты) |
+//|   не трогаются и закрываются по своему TP / по                   |
+//|   InpCloseOldGridOnTrendFlip.                                    |
+//|                                                                  |
+//| Crap-cases (no-op):                                               |
+//|   * лока нет ни на одной стороне → нечего тримить                 |
+//|   * лок одновременно и на BUY и на SELL (нештатно) → не трогаем,  |
+//|     чтобы не разрулить лок-пару непредсказуемо                    |
+//|   * diff < minLot брокера → уже сбалансировано                    |
+//|                                                                  |
+//| После trim-а g_prAvgCount{Buy,Sell} НЕ требуют пересчёта (мы не   |
+//| трогали PR-AVG-*), но всё равно делаем скан для consistency, на  |
+//| случай если в будущем поменяется стратегия отбора целей.         |
 //+------------------------------------------------------------------+
 void TrimStrongSideToWeak()
   {
-   double buyVol, sellVol;
-   ComputeManagedNetVolumes(buyVol, sellVol);
+   double lockBuy  = 0.0, lockSell = 0.0;
+   double origBuy  = 0.0, origSell = 0.0;
 
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double diff   = MathAbs(buyVol - sellVol);
-   if(diff < minLot) return;                            // already balanced enough
-
-   ENUM_POSITION_TYPE strong = (buyVol > sellVol) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-
-   // Collect strong-side tickets with their PnL ----------------------
-   ulong  tickets[];
-   double profits[];
    int total = PositionsTotal();
    for(int i = 0; i < total; i++)
      {
       ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;                       // also selects pos
+      double v = pos.Volume();
+      ENUM_POSITION_TYPE pt = pos.PositionType();
+      string cmt = pos.Comment();
+
+      if(StringFind(cmt, "PR-LOCK") >= 0)
+        {
+         if(pt == POSITION_TYPE_BUY)       lockBuy  += v;
+         else if(pt == POSITION_TYPE_SELL) lockSell += v;
+        }
+      else if(StringFind(cmt, "PR-AVG") < 0)
+        {
+         // not lock, not averager => "original" (manual / loser / pre-existing)
+         if(pt == POSITION_TYPE_BUY)       origBuy  += v;
+         else if(pt == POSITION_TYPE_SELL) origSell += v;
+        }
+      // PR-AVG-* are intentionally ignored — trim must NOT touch them.
+     }
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   bool hasLockBuy  = (lockBuy  >= minLot);
+   bool hasLockSell = (lockSell >= minLot);
+
+   // No clear single-sided lock -> nothing to trim.
+   if(hasLockBuy == hasLockSell)
+     {
+      if(hasLockBuy && hasLockSell)
+         Print("PR trim: lock present on BOTH sides, skipping trim (manual review needed)");
+      return;
+     }
+
+   ENUM_POSITION_TYPE strong;
+   double currentLockVol;
+   double oppositeOrigVol;
+
+   if(hasLockBuy)
+     {
+      strong          = POSITION_TYPE_BUY;
+      currentLockVol  = lockBuy;
+      oppositeOrigVol = origSell;
+     }
+   else
+     {
+      strong          = POSITION_TYPE_SELL;
+      currentLockVol  = lockSell;
+      oppositeOrigVol = origBuy;
+     }
+
+   double diff = currentLockVol - oppositeOrigVol;
+   if(diff < minLot)
+     {
+      // lock already <= opposite original (e.g. someone partially closed
+      // the lock manually) -> nothing to trim.
+      return;
+     }
+
+   // --- Collect PR-LOCK tickets on the strong side --------------------
+   ulong  tickets[];
+   double profits[];
+   int t1 = PositionsTotal();
+   for(int i = 0; i < t1; i++)
+     {
+      ulong t = PositionGetTicket(i);
       if(!IsManaged(t)) continue;
       if(pos.PositionType() != strong) continue;
+      if(StringFind(pos.Comment(), "PR-LOCK") < 0) continue;
       double pnl = pos.Profit() + pos.Swap() + pos.Commission();
       int n = ArraySize(tickets);
       ArrayResize(tickets, n + 1);
@@ -2008,7 +2110,8 @@ void TrimStrongSideToWeak()
    int N = ArraySize(tickets);
    if(N == 0) return;
 
-   // Sort DESC by PnL (most profitable first) ------------------------
+   // Sort DESC by PnL (most profitable lock-leg goes first).  In the
+   // typical case there's exactly one lock leg and the sort is a no-op.
    for(int a = 0; a < N - 1; a++)
       for(int b = a + 1; b < N; b++)
          if(profits[b] > profits[a])
@@ -2017,9 +2120,9 @@ void TrimStrongSideToWeak()
             ulong  tt = tickets[a]; tickets[a] = tickets[b]; tickets[b] = tt;
            }
 
-   double remaining   = diff;
-   int    closedFull  = 0;
-   int    closedPart  = 0;
+   double remaining      = diff;
+   int    closedFull     = 0;
+   int    closedPart     = 0;
    double closedVolTotal = 0.0;
 
    for(int i = 0; i < N && remaining >= minLot; i++)
@@ -2029,7 +2132,7 @@ void TrimStrongSideToWeak()
 
       if(posVol <= remaining + 1e-9)
         {
-         // Full close
+         // Full close of this lock leg
          if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
            {
             closedFull++;
@@ -2038,13 +2141,13 @@ void TrimStrongSideToWeak()
            }
          else
            {
-            PrintFormat("PR trim: PositionClose #%I64u failed err=%d ret=%d",
+            PrintFormat("PR trim: PositionClose lock #%I64u failed err=%d ret=%d",
                         tickets[i], GetLastError(), trade.ResultRetcode());
            }
         }
       else
         {
-         // Partial close to hit exact volume
+         // Partial close to land exactly on the matching volume
          if(ClosePartOfPosition(tickets[i], remaining))
            {
             closedPart++;
@@ -2053,15 +2156,15 @@ void TrimStrongSideToWeak()
            }
          else
            {
-            PrintFormat("PR trim: ClosePartOfPosition #%I64u %.4f failed",
+            PrintFormat("PR trim: ClosePartOfPosition lock #%I64u %.4f failed",
                         tickets[i], remaining);
            }
         }
      }
 
-   if(closedFull == 0 && closedPart == 0) return;       // nothing actually closed
+   if(closedFull == 0 && closedPart == 0) return;
 
-   // Recount PR-AVG positions after trim (counters can drift) -------
+   // PR-AVG-* were not touched, but rescan counters for safety/consistency.
    int avgB = 0, avgS = 0;
    int t2 = PositionsTotal();
    for(int i = 0; i < t2; i++)
@@ -2075,15 +2178,14 @@ void TrimStrongSideToWeak()
    g_prAvgCountBuy  = avgB;
    g_prAvgCountSell = avgS;
 
-   PrintFormat("PR trend-flip trim: %s side -%.4f lot (%d full, %d partial), "
-               "vols after expected ~ %.4f / %.4f",
+   PrintFormat("PR trend-flip trim LOCK: %s side -%.4f lot (%d full, %d partial), "
+               "lock %.4f -> %.4f to match opp original %.4f",
                strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
                closedVolTotal, closedFull, closedPart,
-               (strong == POSITION_TYPE_BUY ? buyVol  - closedVolTotal : buyVol),
-               (strong == POSITION_TYPE_SELL ? sellVol - closedVolTotal : sellVol));
-   Notify(StringFormat("PR trim strong %s -%.4f lot",
+               currentLockVol, currentLockVol - closedVolTotal, oppositeOrigVol);
+   Notify(StringFormat("PR trim lock %s -%.4f lot (match opp orig %.4f)",
                        strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
-                       closedVolTotal));
+                       closedVolTotal, oppositeOrigVol));
 
    if(InpUsePersistence) SaveState();
   }
