@@ -1,7 +1,25 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.45                                                           |
+//|  v1.46                                                           |
+//|  Добавлено в v1.46 (Mode 5 — общий ТП цепочки усреднителей):     |
+//|    - В режиме MODE_PARTIAL_RECOVERY (5), после того как у        |
+//|      советника набирается InpPRCommonTPCount активных            |
+//|      усреднителей (BUY+SELL вместе, по умолчанию 5), активируется|
+//|      ОБЩИЙ ТП на корзину PR-AVG-* — по той же схеме, что v1.45  |
+//|      сделала для безусловной сетки:                              |
+//|        BUY  : закрыть все PR-AVG-B, когда                        |
+//|               Bid >= WAvgBuy  + InpPRCommonTPPts                 |
+//|        SELL : закрыть все PR-AVG-S, когда                        |
+//|               Ask <= WAvgSell - InpPRCommonTPPts                 |
+//|      Денежный триггер InpPRCommonTPMoney (валюта депо, 0=выкл)   |
+//|      имеет приоритет: при суммарном PnL всех PR-AVG-* >= порога  |
+//|      закрывается вся цепочка одним проходом. PR-LOCK, исходные   |
+//|      убыточники и позиции из других режимов не трогаются.        |
+//|      Управляется ключами InpPRCommonTPCount, InpPRCommonTPPts,   |
+//|      InpPRCommonTPMoney в группе «Partial Recovery (Mode 5)».    |
+//|      Совместимо с InpEnsureNetPositive: общий ТП работает на     |
+//|      уровне корзины, не пересекаясь с per-position TP+chip.      |
 //|  Добавлено в v1.45 (Безусловная сетка — общий ТП):               |
 //|    - В режиме `InpUseUncondGrid`, после того как сработало       |
 //|      InpGridCommonTPCount уровней (по умолчанию 5), у сетки      |
@@ -115,9 +133,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.45"
+#property version   "1.46"
 #property strict
-#property description "Universal MT5 Recovery EA v1.45 - Common TP for unconditional grid after N filled levels"
+#property description "Universal MT5 Recovery EA v1.46 - Common TP for Mode 5 averager chain (and v1.45 grid)"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -294,6 +312,9 @@ input double             InpMinNetProfit      = 0.0;                 // Mode5: �
 input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
 input bool               InpCloseOldGridOnTrendFlip = true;          // Mode5: при смене тренда закрывать старую сетку усреднителей по профиту корзинно
 input double             InpOldGridCloseProfit     = 0.0;            // Mode5: мин. суммарный профит старой сетки для её закрытия (валюта депо, >=0)
+input int                InpPRCommonTPCount        = 5;              // Mode5: кол-во активных PR-AVG для активации общего ТП (0=выкл)
+input int                InpPRCommonTPPts          = 50;             // Mode5: общий ТП от средневзв. цены PR-AVG (пункты, на сторону; 0=выкл)
+input double             InpPRCommonTPMoney        = 0.0;            // Mode5: общий ТП по сумме PnL всей цепочки PR-AVG (валюта депо; 0=выкл)
 
 input group "=== Тренд-фильтр для усреднителей ==="
 input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
@@ -486,6 +507,15 @@ int OnInit()
         { Print("InpMinNetProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpOldGridCloseProfit < 0)
         { Print("InpOldGridCloseProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpPRCommonTPCount < 0)
+        { Print("InpPRCommonTPCount must be >= 0");  return INIT_PARAMETERS_INCORRECT; }
+      if(InpPRCommonTPPts   < 0)
+        { Print("InpPRCommonTPPts must be >= 0");    return INIT_PARAMETERS_INCORRECT; }
+      if(InpPRCommonTPMoney < 0)
+        { Print("InpPRCommonTPMoney must be >= 0");  return INIT_PARAMETERS_INCORRECT; }
+      if(InpPRCommonTPCount > 0 && InpPRCommonTPPts <= 0 && InpPRCommonTPMoney <= 0)
+         Print("WARNING: InpPRCommonTPCount=", InpPRCommonTPCount,
+               " set, but both InpPRCommonTPPts and InpPRCommonTPMoney are 0. Common PR-AVG TP is effectively disabled.");
      }
 
    if(InpMode == MODE_HEDGE_LOCK)
@@ -610,6 +640,15 @@ void OnTick()
    if(InpUseUncondGrid && InpGridCommonTPCount > 0
       && (InpGridCommonTPPts > 0 || InpGridCommonTPMoney > 0))
       CheckGridCommonTP();
+
+   // v1.46: Common TP for Mode 5 (Partial Recovery) averager chain once
+   // N+ PR-AVG-* are open.  Mirrors the grid logic above and likewise runs
+   // before BuildBasket so the basket reflects any closures this tick.
+   // Symbol scope is enforced inside CheckPRCommonTP() (Mode 5 is
+   // current-symbol only, matching DoPartialRecovery).
+   if(InpMode == MODE_PARTIAL_RECOVERY && InpPRCommonTPCount > 0
+      && (InpPRCommonTPPts > 0 || InpPRCommonTPMoney > 0))
+      CheckPRCommonTP();
 
 
    BasketState bs;
@@ -2871,6 +2910,163 @@ void CheckGridCommonTP()
             if(!trade.PositionClose(sellT[i], (ulong)InpSlippage))
                PrintFormat("Grid common-TP close SELL #%I64u err=%d",
                            sellT[i], trade.ResultRetcode());
+        }
+     }
+  }
+//+------------------------------------------------------------------+
+
+
+
+//+------------------------------------------------------------------+
+//| v1.46: PR-AVG averager identity for Mode 5 (Partial Recovery).   |
+//|                                                                  |
+//| Mirrors IsGridPosition() but for the Mode 5 averager chain:      |
+//|   * managed (magic == InpMagic);                                 |
+//|   * current symbol when InpSymbolScope == SCOPE_CURRENT;         |
+//|   * comment contains "PR-AVG" — covers both PR-AVG-B and         |
+//|     PR-AVG-S.                                                    |
+//| Excludes PR-LOCK, original losing positions, and AVG/GRID from   |
+//| any other recovery mode.                                         |
+//+------------------------------------------------------------------+
+bool IsPRAveragerPosition(const ulong ticket)
+  {
+   if(!pos.SelectByTicket(ticket)) return false;
+   if(InpSymbolScope == SCOPE_CURRENT && pos.Symbol() != _Symbol) return false;
+   if((long)pos.Magic() != InpMagic) return false;
+   string c = pos.Comment();
+   return (StringFind(c, "PR-AVG") >= 0);
+  }
+
+//+------------------------------------------------------------------+
+//| v1.46: Common TP for Mode 5 (Partial Recovery) averager chain.   |
+//|                                                                  |
+//| Direct analogue of v1.45 CheckGridCommonTP() but applied to the  |
+//| PR-AVG-* basket.  Once at least InpPRCommonTPCount averagers are |
+//| open (BUY+SELL combined), evaluate in order:                     |
+//|   1) Money trigger -- close ALL PR-AVG-* if combined PnL         |
+//|      (Profit + Swap + Commission) >= InpPRCommonTPMoney.         |
+//|   2) Per-side price trigger -- close BUY chain when              |
+//|      Bid >= WAvgBuy + InpPRCommonTPPts*Point; close SELL chain   |
+//|      when Ask <= WAvgSell - InpPRCommonTPPts*Point.              |
+//| Decrement g_prAvgCount{Buy,Sell} per closed ticket so a fresh    |
+//| chain (post-trend-flip or otherwise) starts with multiplier from |
+//| zero — same convention as ProcessProfitableAveragers and         |
+//| TryCloseOldGridByProfit.                                         |
+//|                                                                  |
+//| PR-LOCK, original losers, and any non-PR-AVG-* positions are NOT |
+//| touched here.  Coexists with the per-averager TP+chip path in    |
+//| ProcessProfitableAveragers: that one fires when an INDIVIDUAL    |
+//| averager is in profit by InpAvgTPpts; this one fires when the    |
+//| chain AS A WHOLE is in profit by the configured budget.          |
+//+------------------------------------------------------------------+
+void CheckPRCommonTP()
+  {
+   // Mode 5 is current-symbol only (matches DoPartialRecovery guard).
+   if(InpSymbolScope != SCOPE_CURRENT) return;
+
+   ulong  buyT[], sellT[];
+   double buyVol = 0,  sellVol = 0;
+   double buyPV  = 0,  sellPV  = 0;
+   double totalPnL = 0;
+   int    totalAvg = 0;
+
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsPRAveragerPosition(t)) continue;
+      double v   = pos.Volume();
+      double prc = pos.PriceOpen();
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      totalAvg++;
+      totalPnL += pft;
+      if(pos.PositionType() == POSITION_TYPE_BUY)
+        {
+         buyVol += v; buyPV += prc * v;
+         int n = ArraySize(buyT); ArrayResize(buyT, n + 1); buyT[n] = t;
+        }
+      else if(pos.PositionType() == POSITION_TYPE_SELL)
+        {
+         sellVol += v; sellPV += prc * v;
+         int n = ArraySize(sellT); ArrayResize(sellT, n + 1); sellT[n] = t;
+        }
+     }
+
+   if(totalAvg < InpPRCommonTPCount) return;
+
+   // 1) Money-based trigger: closes the whole averager chain at once.
+   if(InpPRCommonTPMoney > 0 && totalPnL >= InpPRCommonTPMoney)
+     {
+      PrintFormat("PR common TP $: count=%d pnl=%.2f >= %.2f -> close PR-AVG chain",
+                  totalAvg, totalPnL, InpPRCommonTPMoney);
+      Notify(StringFormat("PR common TP $ hit: %.2f >= %.2f, closing %d averagers",
+                          totalPnL, InpPRCommonTPMoney, totalAvg));
+      int closedB = 0, closedS = 0;
+      for(int i = 0; i < ArraySize(buyT); i++)
+        {
+         if(trade.PositionClose(buyT[i], (ulong)InpSlippage)) closedB++;
+         else PrintFormat("PR common-TP close BUY #%I64u err=%d",
+                          buyT[i], trade.ResultRetcode());
+        }
+      for(int i = 0; i < ArraySize(sellT); i++)
+        {
+         if(trade.PositionClose(sellT[i], (ulong)InpSlippage)) closedS++;
+         else PrintFormat("PR common-TP close SELL #%I64u err=%d",
+                          sellT[i], trade.ResultRetcode());
+        }
+      g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy  - closedB);
+      g_prAvgCountSell = MathMax(0, g_prAvgCountSell - closedS);
+      return;
+     }
+
+   // 2) Price-based per-side trigger: WAvg + TPpts.
+   if(InpPRCommonTPPts <= 0) return;
+
+   sym.Name(_Symbol); sym.RefreshRates();
+   double pt  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double bid = sym.Bid();
+   double ask = sym.Ask();
+   if(pt <= 0 || bid <= 0 || ask <= 0) return;
+
+   if(buyVol > 0 && ArraySize(buyT) > 0)
+     {
+      double wavg   = buyPV / buyVol;
+      double target = NormalizeDouble(wavg + InpPRCommonTPPts * pt, _Digits);
+      if(bid >= target)
+        {
+         PrintFormat("PR common TP BUY: %d averagers, WAvg=%.5f tgt=%.5f bid=%.5f",
+                     ArraySize(buyT), wavg, target, bid);
+         Notify(StringFormat("PR common TP BUY hit: %d averagers @ %.5f (WAvg=%.5f +%dpts)",
+                             ArraySize(buyT), bid, wavg, InpPRCommonTPPts));
+         int closed = 0;
+         for(int i = 0; i < ArraySize(buyT); i++)
+           {
+            if(trade.PositionClose(buyT[i], (ulong)InpSlippage)) closed++;
+            else PrintFormat("PR common-TP close BUY #%I64u err=%d",
+                             buyT[i], trade.ResultRetcode());
+           }
+         g_prAvgCountBuy = MathMax(0, g_prAvgCountBuy - closed);
+        }
+     }
+
+   if(sellVol > 0 && ArraySize(sellT) > 0)
+     {
+      double wavg   = sellPV / sellVol;
+      double target = NormalizeDouble(wavg - InpPRCommonTPPts * pt, _Digits);
+      if(ask <= target)
+        {
+         PrintFormat("PR common TP SELL: %d averagers, WAvg=%.5f tgt=%.5f ask=%.5f",
+                     ArraySize(sellT), wavg, target, ask);
+         Notify(StringFormat("PR common TP SELL hit: %d averagers @ %.5f (WAvg=%.5f -%dpts)",
+                             ArraySize(sellT), ask, wavg, InpPRCommonTPPts));
+         int closed = 0;
+         for(int i = 0; i < ArraySize(sellT); i++)
+           {
+            if(trade.PositionClose(sellT[i], (ulong)InpSlippage)) closed++;
+            else PrintFormat("PR common-TP close SELL #%I64u err=%d",
+                             sellT[i], trade.ResultRetcode());
+           }
+         g_prAvgCountSell = MathMax(0, g_prAvgCountSell - closed);
         }
      }
   }
