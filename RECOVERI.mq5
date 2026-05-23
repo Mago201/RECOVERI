@@ -1,7 +1,33 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.50                                                           |
+//|  v1.51                                                           |
+//|  Добавлено в v1.51:                                              |
+//|    - Шаг сеток усреднения по ATR выбранного ТФ.                  |
+//|      Ключи: InpUseATRStep (по умолчанию false), InpATRTF (D1),   |
+//|      InpATRPeriod (14), InpATRMultiplier (1.0). Когда включено,  |
+//|      базовый шаг (в пунктах) = ATR * мультипликатор, переведённый|
+//|      в пункты брокера. Применяется к Mode 1 (Averaging),         |
+//|      Mode 2 (Martingale) через CurrentStepPoints() и к Mode 5    |
+//|      (PR-AVG-B/S) через инлайн-расчёт. Множитель шага            |
+//|      (InpStepMultiplier / InpAvgStepMul) применяется поверх ATR. |
+//|      Если ATR не загружается — fallback на InpStepPoints/        |
+//|      InpAvgStepPts. По умолчанию выключено -> поведение v1.50.   |
+//|    - Выравнивание лока по выбранному ТФ. На каждом новом баре    |
+//|      InpLockAlignTF (по умолчанию D1) считается перевес BUY/SELL |
+//|      по объёму всех managed-позиций. Если |buy-sell| >=          |
+//|      InpLockAlignMinDiffLot (минимум minLot брокера) — на        |
+//|      сильной стороне закрываются позиции с наибольшим PnL по     |
+//|      убыванию (откусывание «положительной зоны»), пока не        |
+//|      выровняем объёмы. По умолчанию (InpLockAlignOnlyProfitable= |
+//|      true) убыточные позиции не трогаются: если винеров не       |
+//|      хватило — выравнивание частичное и довыполнится на          |
+//|      следующем баре. По умолчанию (InpLockAlignRequireBothSides= |
+//|      true) запускается только когда обе стороны открыты (то есть |
+//|      «лок»). Состояние g_lockAlignLastBar сохраняется в GV       |
+//|      (LK_AL_BAR) и сбрасывается на смене режима / Reset State.   |
+//|      Работает поверх InpTrendFlipTrimStrong: trim делает разовое |
+//|      выравнивание на флипе, LockAlign — периодическое по бару.   |
 //|  Добавлено в v1.50 (Mode 5 — Partial Recovery):                  |
 //|    - Опциональное выравнивание объёмов на смене тренда:          |
 //|      InpTrendFlipTrimStrong (по умолчанию false). Когда флипнул  |
@@ -116,9 +142,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.50"
+#property version   "1.51"
 #property strict
-#property description "Universal MT5 Recovery EA v1.50 - Mode5 trend-flip optional trim of strong side to weak"
+#property description "Universal MT5 Recovery EA v1.51 - ATR grid step + lock alignment by selected TF"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -305,6 +331,19 @@ input int                InpTrendFastMA      = 21;                   // Пери
 input int                InpTrendSlowMA      = 50;                   // Период медленной MA
 input bool               InpOneOrderPerBar   = false;                // Не более одного усреднителя на свечу
 
+input group "=== Шаг сеток усреднения по ATR ==="
+input bool               InpUseATRStep       = false;                // Включить шаг по ATR (для Mode 1/2 и Mode 5 PR-AVG)
+input ENUM_TIMEFRAMES    InpATRTF            = PERIOD_D1;            // Таймфрейм ATR
+input int                InpATRPeriod        = 14;                   // Период ATR
+input double             InpATRMultiplier    = 1.0;                  // Множитель ATR -> шаг (баз. шаг = ATR * мульт.)
+
+input group "=== Выравнивание лока по выбранному ТФ ==="
+input bool               InpUseLockAlign           = false;          // Включить выравнивание лока на новом баре выбранного ТФ
+input ENUM_TIMEFRAMES    InpLockAlignTF            = PERIOD_D1;      // Таймфрейм триггера выравнивания (D1 = раз в сутки)
+input double             InpLockAlignMinDiffLot    = 0.0;            // Мин. перевес объёма для выравнивания (лот, 0 = только minLot брокера)
+input bool               InpLockAlignOnlyProfitable= true;           // Откусывать только положительную зону (не трогать убыточные)
+input bool               InpLockAlignRequireBothSides = true;        // Запускать только когда обе стороны открыты (настоящий лок)
+
 input group "=== Отключение чужих советников ==="
 input ENUM_DISABLE_EAS   InpDisableOtherEAs  = DISABLE_NONE;         // Снять других ботов при старте recovery
 
@@ -422,6 +461,11 @@ int           g_prLastTrend   = 0;         // last seen trend direction (-1/0/+1
 bool                g_prCloseOldActive = false;
 ENUM_POSITION_TYPE  g_prCloseOldSide   = POSITION_TYPE_BUY;
 
+// v1.51: timeframe-driven lock alignment.  Stores the open-time of the
+// last InpLockAlignTF bar we processed; on every new bar we run
+// DoLockAlignByTF() once.  Persisted as LK_AL_BAR.
+datetime            g_lockAlignLastBar = 0;
+
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
 
@@ -467,6 +511,23 @@ int OnInit()
         { Print("InpMinNetProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
       if(InpOldGridCloseProfit < 0)
         { Print("InpOldGridCloseProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+     }
+
+   // v1.51 ATR step / LockAlign validation (mode-agnostic) ---------------
+   if(InpUseATRStep)
+     {
+      if(InpATRPeriod <= 0)
+        { Print("InpATRPeriod must be > 0 when InpUseATRStep=true"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpATRMultiplier <= 0)
+        { Print("InpATRMultiplier must be > 0 when InpUseATRStep=true"); return INIT_PARAMETERS_INCORRECT; }
+     }
+   if(InpUseLockAlign)
+     {
+      if(InpLockAlignMinDiffLot < 0)
+        { Print("InpLockAlignMinDiffLot must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpSymbolScope != SCOPE_CURRENT)
+        Print("WARNING: InpUseLockAlign=true but InpSymbolScope != SCOPE_CURRENT; "
+              "lock alignment runs only on the chart symbol.");
      }
 
    if(InpMode == MODE_HEDGE_LOCK)
@@ -532,9 +593,10 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.50 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.51 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f ATRstep=%d LockAlign=%d Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
-               (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
+               (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold,
+               (int)InpUseATRStep, (int)InpUseLockAlign, InpMagic);
    return INIT_SUCCEEDED;
   }
 
@@ -589,6 +651,18 @@ void OnTick()
    BasketState bs;
    BuildBasket(bs);
    ApplyBasketTrailing(bs);
+
+   // v1.51: timeframe-driven lock alignment.  Runs once per new bar of
+   // InpLockAlignTF, trims heavier side using profitable positions only
+   // (configurable). Mode-agnostic: works whether the lock came from
+   // HedgeLock, PartialRecovery PR-LOCK, manual hedging, etc.
+   if(InpUseLockAlign && bs.count > 0)
+     {
+      DoLockAlignByTF();
+      // After alignment positions may have closed -> rebuild basket so
+      // the rest of OnTick uses fresh counts/volumes/PnL.
+      BuildBasket(bs);
+     }
 
    if(bs.count > 0 && CheckBasketTargets(bs))
       BuildBasket(bs);
@@ -1080,8 +1154,38 @@ double NormalizeLot(const string symbol, double lot)
 
 int CurrentStepPoints(const int n)
   {
-   double s = (double)InpStepPoints * MathPow(InpStepMultiplier, MathMax(0, n-1));
+   double s = (double)InpStepPoints;
+   if(InpUseATRStep)
+     {
+      double atrPts = GetATRPoints(InpATRTF, InpATRPeriod);
+      if(atrPts > 0) s = atrPts * InpATRMultiplier;
+     }
+   s *= MathPow(InpStepMultiplier, MathMax(0, n-1));
    return (int)MathMax(1.0, s);
+  }
+
+//+------------------------------------------------------------------+
+//| ATR в пунктах брокера на выбранном ТФ.                           |
+//|   Возвращает ATR(period) на InpATRTF (или указанном tf), пере-   |
+//|   ведённый в пункты через SYMBOL_POINT.  Возвращает 0 при ошибке |
+//|   загрузки индикатора или нулевом ATR — вызывающий код должен    |
+//|   делать fallback на статический шаг (InpStepPoints / InpAvgStep |
+//|   Pts).  Используется CurrentStepPoints() для Mode 1/2 и инлайн- |
+//|   расчётом PR-AVG в DoPartialRecovery() для Mode 5.              |
+//+------------------------------------------------------------------+
+double GetATRPoints(const ENUM_TIMEFRAMES tf, const int period)
+  {
+   if(period <= 0) return 0.0;
+   double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   if(pt <= 0) return 0.0;
+   int h = iATR(_Symbol, tf, period);
+   if(h == INVALID_HANDLE) return 0.0;
+   double buf[1];
+   int copied = CopyBuffer(h, 0, 0, 1, buf);
+   IndicatorRelease(h);
+   if(copied <= 0) return 0.0;
+   if(buf[0] <= 0) return 0.0;
+   return buf[0] / pt;
   }
 
 //+------------------------------------------------------------------+
@@ -1812,7 +1916,13 @@ void DoPartialRecovery(const BasketState &bs)
    if(wantBuy && g_prAvgCountBuy < InpMaxAveragers)
      {
       double lastB = LastAveragerPrice(POSITION_TYPE_BUY, "PR-AVG-B");
-      double step  = (double)InpAvgStepPts * MathPow(InpAvgStepMul, MathMax(0, g_prAvgCountBuy)) * pt;
+      double baseStepB = (double)InpAvgStepPts;
+      if(InpUseATRStep)
+        {
+         double atrPts = GetATRPoints(InpATRTF, InpATRPeriod);
+         if(atrPts > 0) baseStepB = atrPts * InpATRMultiplier;
+        }
+      double step  = baseStepB * MathPow(InpAvgStepMul, MathMax(0, g_prAvgCountBuy)) * pt;
       bool spaceOK = (lastB <= 0) || (ask <= lastB - step);
       bool barOK   = !InpOneOrderPerBar || IsNewBar(g_prLastBarTime);
       if(spaceOK && barOK)
@@ -1830,7 +1940,13 @@ void DoPartialRecovery(const BasketState &bs)
    if(wantSell && g_prAvgCountSell < InpMaxAveragers)
      {
       double lastS = LastAveragerPrice(POSITION_TYPE_SELL, "PR-AVG-S");
-      double step  = (double)InpAvgStepPts * MathPow(InpAvgStepMul, MathMax(0, g_prAvgCountSell)) * pt;
+      double baseStepS = (double)InpAvgStepPts;
+      if(InpUseATRStep)
+        {
+         double atrPts = GetATRPoints(InpATRTF, InpATRPeriod);
+         if(atrPts > 0) baseStepS = atrPts * InpATRMultiplier;
+        }
+      double step  = baseStepS * MathPow(InpAvgStepMul, MathMax(0, g_prAvgCountSell)) * pt;
       bool spaceOK = (lastS <= 0) || (bid >= lastS + step);
       bool barOK   = !InpOneOrderPerBar || IsNewBar(g_prLastBarTimeS);
       if(spaceOK && barOK)
@@ -2084,6 +2200,170 @@ void TrimStrongSideToWeak()
    Notify(StringFormat("PR trim strong %s -%.4f lot",
                        strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
                        closedVolTotal));
+
+   if(InpUsePersistence) SaveState();
+  }
+
+//+------------------------------------------------------------------+
+//| v1.51: Lock alignment by selected timeframe.                      |
+//|                                                                   |
+//| Triggered once per new bar of InpLockAlignTF (default D1).        |
+//|   1) Sum BUY / SELL volume across ALL managed positions (PR-AVG, |
+//|      PR-LOCK, originals, AVG-*, GRID-*, MANUAL-LOCK).             |
+//|   2) Compute imbalance diff = |buyVol - sellVol|.  Skip if it    |
+//|      is below max(broker minLot, InpLockAlignMinDiffLot).        |
+//|   3) If InpLockAlignRequireBothSides=true and one side is empty, |
+//|      skip (this isn't a lock yet).                                |
+//|   4) On the heavier side collect candidates, sort by PnL DESC.   |
+//|      With InpLockAlignOnlyProfitable=true (default) we only take |
+//|      positions with PnL > 0 — "biting off the positive zone"     |
+//|      without realising losses.                                    |
+//|   5) Close (full or partial) until the heavier side matches the  |
+//|      lighter side or candidates run out.  If candidates ran out  |
+//|      mid-way, we just stop — next bar of the TF will retry.      |
+//|   6) Recount g_prAvgCount{Buy,Sell} from open positions and      |
+//|      persist if InpUsePersistence is on.                          |
+//|                                                                   |
+//| Coexists with InpTrendFlipTrimStrong (one-shot trim on flip)     |
+//| and InpCloseOldGridOnTrendFlip — they touch different triggers.  |
+//+------------------------------------------------------------------+
+void DoLockAlignByTF()
+  {
+   if(!InpUseLockAlign) return;
+   if(InpSymbolScope != SCOPE_CURRENT) return;
+
+   datetime cur = iTime(_Symbol, InpLockAlignTF, 0);
+   if(cur == 0) return;
+   if(g_lockAlignLastBar == 0)
+     {
+      // first call after init: prime, do not fire
+      g_lockAlignLastBar = cur;
+      if(InpUsePersistence) SaveState();
+      return;
+     }
+   if(cur == g_lockAlignLastBar) return;
+   g_lockAlignLastBar = cur;
+   if(InpUsePersistence) SaveState();
+
+   double buyVol, sellVol;
+   ComputeManagedNetVolumes(buyVol, sellVol);
+
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double minDiff = MathMax(minLot, InpLockAlignMinDiffLot);
+   double diff    = MathAbs(buyVol - sellVol);
+   if(diff < minDiff) return;
+
+   if(InpLockAlignRequireBothSides && (buyVol < minLot || sellVol < minLot))
+     return;  // not a real lock — skip
+
+   ENUM_POSITION_TYPE strong = (buyVol > sellVol) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+   // Collect strong-side tickets with PnL ----------------------------
+   ulong  tickets[];
+   double profits[];
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != strong) continue;
+      double pnl = pos.Profit() + pos.Swap() + pos.Commission();
+      if(InpLockAlignOnlyProfitable && pnl <= 0) continue;  // bite the positive zone only
+      int n = ArraySize(tickets);
+      ArrayResize(tickets, n + 1);
+      ArrayResize(profits, n + 1);
+      tickets[n] = t;
+      profits[n] = pnl;
+     }
+   int N = ArraySize(tickets);
+   if(N == 0)
+     {
+      PrintFormat("LockAlign[%s]: imbalance %.4f lot but no %s candidates "
+                  "(only-profitable=%d)",
+                  EnumToString(InpLockAlignTF), diff,
+                  strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                  (int)InpLockAlignOnlyProfitable);
+      return;
+     }
+
+   // Sort DESC by PnL (close winners first) -------------------------
+   for(int a = 0; a < N - 1; a++)
+      for(int b = a + 1; b < N; b++)
+         if(profits[b] > profits[a])
+           {
+            double tp = profits[a]; profits[a] = profits[b]; profits[b] = tp;
+            ulong  tt = tickets[a]; tickets[a] = tickets[b]; tickets[b] = tt;
+           }
+
+   double remaining     = diff;
+   int    closedFull    = 0;
+   int    closedPart    = 0;
+   double closedVolTotal= 0.0;
+   double realizedPnL   = 0.0;
+
+   for(int i = 0; i < N && remaining >= minLot; i++)
+     {
+      if(!pos.SelectByTicket(tickets[i])) continue;
+      double posVol = pos.Volume();
+      double posPnL = pos.Profit() + pos.Swap() + pos.Commission();
+
+      if(posVol <= remaining + 1e-9)
+        {
+         if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
+           {
+            closedFull++;
+            closedVolTotal += posVol;
+            realizedPnL    += posPnL;
+            remaining      -= posVol;
+           }
+         else
+            PrintFormat("LockAlign: PositionClose #%I64u failed err=%d ret=%d",
+                        tickets[i], GetLastError(), trade.ResultRetcode());
+        }
+      else
+        {
+         if(ClosePartOfPosition(tickets[i], remaining))
+           {
+            closedPart++;
+            // realizedPnL on partial is approximated proportionally
+            if(posVol > 0) realizedPnL += posPnL * (remaining / posVol);
+            closedVolTotal += remaining;
+            remaining       = 0.0;
+           }
+         else
+            PrintFormat("LockAlign: ClosePartOfPosition #%I64u %.4f failed",
+                        tickets[i], remaining);
+        }
+     }
+
+   if(closedFull == 0 && closedPart == 0) return;
+
+   // Recount PR-AVG counters (the trim might have eaten PR-AVG-*) --
+   int avgB = 0, avgS = 0;
+   int t2 = PositionsTotal();
+   for(int i = 0; i < t2; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      string cmt = pos.Comment();
+      if(StringFind(cmt, "PR-AVG-B") >= 0)      avgB++;
+      else if(StringFind(cmt, "PR-AVG-S") >= 0) avgS++;
+     }
+   g_prAvgCountBuy  = avgB;
+   g_prAvgCountSell = avgS;
+
+   PrintFormat("LockAlign[%s] %s side -%.4f lot (%d full, %d partial), "
+               "realized ~%.2f, vols ~%.4f / %.4f, bar %s",
+               EnumToString(InpLockAlignTF),
+               strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
+               closedVolTotal, closedFull, closedPart, realizedPnL,
+               (strong == POSITION_TYPE_BUY ? buyVol  - closedVolTotal : buyVol),
+               (strong == POSITION_TYPE_SELL ? sellVol - closedVolTotal : sellVol),
+               TimeToString(cur, TIME_DATE | TIME_MINUTES));
+   Notify(StringFormat("LockAlign[%s]: trim %s -%.4f lot (+%.2f)",
+                       EnumToString(InpLockAlignTF),
+                       strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                       closedVolTotal, realizedPnL));
 
    if(InpUsePersistence) SaveState();
   }
@@ -2353,7 +2633,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.50 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.51 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -2422,6 +2702,13 @@ void UpdatePanel(const BasketState &bs)
    if(g_paused)         filt += " PAUSE";
    if(InpUseTimeFilter) filt += IsTimeAllowed() ? " time-OK" : " TIME-BLK";
    if(InpUseNewsFilter) filt += IsNewsBlocked() ? " NEWS-BLK" : " news-OK";
+   if(InpUseATRStep)
+     {
+      double atrPts = GetATRPoints(InpATRTF, InpATRPeriod);
+      filt += StringFormat(" ATR(%s,%d)=%.0fpt", EnumToString(InpATRTF), InpATRPeriod, atrPts);
+     }
+   if(InpUseLockAlign)
+      filt += StringFormat(" LkAlign[%s]", EnumToString(InpLockAlignTF));
    if(filt == "Filter:") filt += " none";
    color fclr = (g_paused || g_blockReason != "") ? clrOrange : InpPanelColor;
    SetLabel("filter", filt, fclr);
@@ -2563,6 +2850,7 @@ void SaveState()
    GlobalVariableSet(g_gvPrefix + "PR_PH",   (double)g_prPhase);
    GlobalVariableSet(g_gvPrefix + "PR_COA",  g_prCloseOldActive ? 1.0 : 0.0);
    GlobalVariableSet(g_gvPrefix + "PR_COS",  (g_prCloseOldSide == POSITION_TYPE_BUY) ? 0.0 : 1.0);
+   GlobalVariableSet(g_gvPrefix + "LK_AL_BAR",(double)g_lockAlignLastBar);
 
    // Wipe stale BE/TSL globals for tickets no longer present
    int total = GlobalVariablesTotal();
@@ -2593,7 +2881,7 @@ ENUM_LOAD_STATUS LoadState()
    // Detect any pre-existing state at all (for clean-vs-legacy distinction)
    string allKeys[] = {"PAUSED","ESTOP","PEAK_C","PEAK_B","PEAK_S","GRID","BASE_BAL",
                        "LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
-                       "RC_TRIG","OEAS_DIS","PR_PH","PR_COA","PR_COS"};
+                       "RC_TRIG","OEAS_DIS","PR_PH","PR_COA","PR_COS","LK_AL_BAR"};
    bool anyState = false;
    for(int i = 0; i < ArraySize(allKeys); i++)
       if(GlobalVariableCheck(g_gvPrefix + allKeys[i])) { anyState = true; break; }
@@ -2610,6 +2898,7 @@ ENUM_LOAD_STATUS LoadState()
    if(GlobalVariableCheck(g_gvPrefix + "PEAK_S"))   g_peakSellProfit  = GlobalVariableGet(g_gvPrefix + "PEAK_S");
    if(GlobalVariableCheck(g_gvPrefix + "GRID"))     g_gridPlaced      = (GlobalVariableGet(g_gvPrefix + "GRID")  > 0.5);
    if(GlobalVariableCheck(g_gvPrefix + "BASE_BAL")) g_baselineBalance = GlobalVariableGet(g_gvPrefix + "BASE_BAL");
+   if(GlobalVariableCheck(g_gvPrefix + "LK_AL_BAR"))g_lockAlignLastBar= (datetime)GlobalVariableGet(g_gvPrefix + "LK_AL_BAR");
 
    // --- Mode-specific keys: load only if mode matches; otherwise reset to defaults ---
    if(ignoreModeKeys)
@@ -2716,6 +3005,7 @@ void DoResetState()
    g_prLastTrend       = 0;
    g_prCloseOldActive  = false;
    g_prCloseOldSide    = POSITION_TYPE_BUY;
+   g_lockAlignLastBar  = 0;
    g_recoveryTriggered = false;
    g_otherEAsDisabled  = false;
    g_peakProfit        = 0.0;
@@ -2728,7 +3018,8 @@ void DoResetState()
       string keys[] = {"LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
                        "RC_TRIG","OEAS_DIS","PR_PH",
                        "PR_COA","PR_COS",
-                       "PEAK_C","PEAK_B","PEAK_S"};
+                       "PEAK_C","PEAK_B","PEAK_S",
+                       "LK_AL_BAR"};
       for(int i = 0; i < ArraySize(keys); i++)
         {
          string k = g_gvPrefix + keys[i];
