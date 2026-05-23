@@ -291,7 +291,8 @@ input int                InpOverlapAfterN    = 0;                    // Closing 
 input ENUM_RECOVERY_PRIORITY InpRecoveryPriority = PRIO_HARD;        // Приоритет: какие убыточные ордера обрабатывать первыми
 input ulong              InpFirstTicket      = 0;                    // Конкретный тикет первым (0=не использовать)
 input bool               InpEnsureNetPositive = true;                // Mode5: гарантировать неотрицательный итог пары (TP усреднителя + чип убыточника)
-input double             InpMinNetProfit      = 0.0;                 // Mode5: минимальный итог пары в валюте депо (>=0)
+input double             InpMinNetProfit      = 0.0;                 // Mode5: минимальный итог пары в валюте депо (>=0), абсолютный «пол»
+input double             InpMinNetProfitPct   = 0.0;                 // Mode5: минимальный итог пары в % от прибыли усреднителя (0..100). Эффективный пол = max(InpMinNetProfit, avgProfit*Pct/100)
 input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
 input bool               InpCloseOldGridOnTrendFlip = true;          // Mode5: при смене тренда закрывать старую сетку усреднителей по профиту корзинно
 input double             InpOldGridCloseProfit     = 0.0;            // Mode5: мин. суммарный профит старой сетки для её закрытия (валюта депо, >=0)
@@ -2091,7 +2092,9 @@ void TrimStrongSideToWeak()
 //| For each profitable averager: close it, then chip a SAFE amount   |
 //| off the worst losing position on the OPPOSITE side, sized so the  |
 //| combined cycle PnL (averager profit + chip realized loss) stays   |
-//| >= InpMinNetProfit.                                                |
+//| >= effective floor.                                                |
+//|                                                                   |
+//| effFloor = max(InpMinNetProfit, avgProfit * InpMinNetProfitPct/100)|
 //|                                                                   |
 //| If even the broker's minLot would drag the cycle below the floor, |
 //| the chip is skipped entirely and the averager profit is locked in |
@@ -2154,11 +2157,16 @@ void ProcessProfitableAveragers(const BasketState &bs)
          else if(InpEnsureNetPositive)
            {
             double pnlPerLot = tgtPnL / tgtVol;        // <0 ($/lot)
-            double headroom  = avgProfit - InpMinNetProfit;
+            // Effective floor: max of absolute floor and percentage-of-profit
+            double pctClamped = MathMax(0.0, MathMin(100.0, InpMinNetProfitPct));
+            double effFloor   = InpMinNetProfit;
+            if(pctClamped > 0.0)
+               effFloor = MathMax(effFloor, avgProfit * pctClamped / 100.0);
+            double headroom  = avgProfit - effFloor;
             if(headroom <= 0)
               {
-               skipReason = StringFormat("avgProfit %.2f <= floor %.2f",
-                                         avgProfit, InpMinNetProfit);
+               skipReason = StringFormat("avgProfit %.2f <= floor %.2f (abs=%.2f, pct=%.1f%%)",
+                                         avgProfit, effFloor, InpMinNetProfit, pctClamped);
               }
             else
               {
