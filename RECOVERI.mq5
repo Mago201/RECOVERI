@@ -1470,7 +1470,7 @@ void DisableOtherEAs()
                         (InpDisableOtherEAs == DISABLE_SAME_SYMBOL && sameSym);
          if(inScope)
            {
-            string ename = ChartGetString(cid, CHARTPROPERTY_EXPERT_NAME);
+            string ename = ChartGetString(cid, CHART_EXPERT_NAME);
             if(ename != "" && ename != MQLInfoString(MQL_PROGRAM_NAME))
               {
                list += StringFormat("%s[%s] ", sym2, ename);
