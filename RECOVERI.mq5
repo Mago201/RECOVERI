@@ -1,7 +1,34 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.48                                                           |
+//|  v1.49                                                           |
+//|  Добавлено в v1.49:                                              |
+//|    1) Trim сильной стороны на смене тренда (для всех групп):     |
+//|       при `InpTrendFlipTrimStrong=true` после флипа тренда       |
+//|       (g_prLastTrend != trend) советник суммирует объём ВСЕХ     |
+//|       managed-позиций раздельно по BUY и SELL (PR-AVG-*, PR-LOCK,|
+//|       исходные, AVG-*, GRID-* — всё, что попадает в IsManaged)   |
+//|       и выравнивает «сильную» сторону под «слабую»: режет        |
+//|       diff = |BUY-vol - SELL-vol|, начиная с самых прибыльных    |
+//|       позиций сильной стороны (lock-in профита), c частичным     |
+//|       закрытием последней при необходимости. Работает в Mode 5   |
+//|       вместе с InpUseTrendFilter; срабатывает в том же блоке,    |
+//|       что InpRestartGridOnTrendFlip / InpCloseOldGridOnTrendFlip,|
+//|       и не отменяет их. Цель: если рынок развернулся, не сидеть  |
+//|       перекосом против нового тренда.                            |
+//|    2) Зеркальный чип от прибыли при чипе от убытка               |
+//|       (InpBalanceChipFromProfit, default false): когда советник  |
+//|       откусывает чип от убыточной позиции (в                     |
+//|       ProcessProfitableAveragers и в ChipDeepestLoserAfter-      |
+//|       PRCommonTP), параллельно режется РАВНЫЙ лот от прибыльной  |
+//|       позиции на ПРОТИВОПОЛОЖНОЙ стороне. Если у прибыльной      |
+//|       стороны нет позиции достаточного объёма — обе порции       |
+//|       уменьшаются до доступного (≥ minLot брокера); если         |
+//|       прибыльной позиции с объёмом ≥ minLot вообще нет — оба     |
+//|       чипа пропускаются (флаг ставит баланс выше «съедания»      |
+//|       убытка). Не пересекается с InpEnsureNetPositive: сначала   |
+//|       считается «безопасный» chipLot по net-positive бюджету,    |
+//|       затем он уже зеркалится в баланс-партнёре.                 |
 //|  Добавлено в v1.48 (Mode 5 — общий ТП откусывает чип от убытка): |
 //|    - Фикс жалобы пользователя «после v1.47 перестало откусывать  |
 //|      чип»: до 1.47 убыточник «съедался» только в                 |
@@ -187,9 +214,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.48"
+#property version   "1.49"
 #property strict
-#property description "Universal MT5 Recovery EA v1.48 - Mode 5: common TP also chips a piece off the deepest loser using the basket's realized profit"
+#property description "Universal MT5 Recovery EA v1.49 - Mode 5: trend-flip trims strong side to match weak side; optional balanced chip-from-profit mirrors chip-from-loss"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -366,6 +393,8 @@ input double             InpMinNetProfit      = 0.0;                 // Mode5: �
 input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
 input bool               InpCloseOldGridOnTrendFlip = true;          // Mode5: при смене тренда закрывать старую сетку усреднителей по профиту корзинно
 input double             InpOldGridCloseProfit     = 0.0;            // Mode5: мин. суммарный профит старой сетки для её закрытия (валюта депо, >=0)
+input bool               InpTrendFlipTrimStrong    = false;          // v1.49 Mode5: при смене тренда выровнять "сильную" сторону под объём слабой (режет все группы)
+input bool               InpBalanceChipFromProfit  = false;          // v1.49 Mode5: при чипе от убытка зеркально откусить равный лот от прибыли противоположной стороны
 input int                InpPRCommonTPCount        = 5;              // Mode5: кол-во активных PR-AVG для активации общего ТП (0=выкл)
 input int                InpPRCommonTPPts          = 50;             // Mode5: общий ТП от средневзв. цены PR-AVG (пункты, на сторону; 0=выкл)
 input double             InpPRCommonTPMoney        = 0.0;            // Mode5: общий ТП по сумме PnL всей цепочки PR-AVG (валюта депо; 0=выкл)
@@ -1975,6 +2004,15 @@ void DoPartialRecovery(const BasketState &bs)
                              g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"));
         }
 
+      // v1.49: trim the heavier side down to the lighter side's net
+      // volume across ALL managed groups (PR-AVG-*, PR-LOCK-*, originals,
+      // AVG-*, GRID-*).  Runs right after the existing flip actions and
+      // is independent of them — Restart/Close-old still apply to the
+      // PR-AVG chain on top.  Only kicks in when InpTrendFlipTrimStrong
+      // is enabled; runs once per flip event.
+      if(InpTrendFlipTrimStrong)
+         TrimStrongSideToWeak();
+
       if(InpUsePersistence) SaveState();
      }
    if(trend != 0) g_prLastTrend = trend;
@@ -2246,11 +2284,38 @@ void ProcessProfitableAveragers(const BasketState &bs)
       // --- Chip the loser if safe; otherwise just lock the avg profit -
       if(willChip && target != 0)
         {
-         if(ClosePartOfPosition(target, safeChip))
+         // v1.49: optionally mirror the chip with an equal lot taken
+         // from a profitable position on the opposite (= averager's)
+         // side, so net BUY/SELL exposure stays balanced.  When the
+         // balance flag is on and no profitable opposite has at least
+         // minLot of volume, ResolveChipWithBalance returns 0 and we
+         // skip the chip altogether (averager profit still locked).
+         ulong  balT = 0;
+         double balL = 0.0;
+         double effChip = ResolveChipWithBalance(target, safeChip, balT, balL);
+         if(effChip <= 0)
            {
-            PrintFormat("PR: chipped %.4f from #%I64u (avgP=%.2f, prio=%d, mode=%s)",
-                        safeChip, target, avgProfit, (int)InpRecoveryPriority,
-                        InpEnsureNetPositive ? "net+" : "fixed");
+            PrintFormat("PR: chip skipped on #%I64u — balance partner missing; "
+                        "averager profit %.2f locked.", target, avgProfit);
+           }
+         else
+           {
+            if(ClosePartOfPosition(target, effChip))
+              {
+               PrintFormat("PR: chipped %.4f from #%I64u (avgP=%.2f, prio=%d, mode=%s%s)",
+                           effChip, target, avgProfit, (int)InpRecoveryPriority,
+                           InpEnsureNetPositive ? "net+" : "fixed",
+                           balT != 0 ? " bal+" : "");
+               if(balT != 0)
+                 {
+                  if(ClosePartOfPosition(balT, balL))
+                     PrintFormat("PR: balance-chip %.4f from profitable #%I64u (mirrors #%I64u)",
+                                 balL, balT, target);
+                  else
+                     PrintFormat("PR: balance-chip on #%I64u FAILED — net exposure shifted by %.4f",
+                                 balT, effChip);
+                 }
+              }
            }
         }
       else if(target != 0)
@@ -3056,7 +3121,275 @@ int CountPRAveragers()
   }
 
 //+------------------------------------------------------------------+
-//| v1.48: chip the deepest losing original after a CheckPRCommonTP() |
+//| v1.49: sum the lot volume of all *managed* positions per side.    |
+//| Counts every position that passes IsManaged() — PR-AVG-*, PR-LOCK,|
+//| original losers, AVG-*, GRID-*, manual (depending on              |
+//| InpManageScope/InpSymbolScope).  Used by TrimStrongSideToWeak()   |
+//| on a trend flip to decide which side is "heavy" and by how much.  |
+//+------------------------------------------------------------------+
+void ComputeManagedNetVolumes(double &buyVol, double &sellVol)
+  {
+   buyVol  = 0.0;
+   sellVol = 0.0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() == POSITION_TYPE_BUY) buyVol  += pos.Volume();
+      else                                         sellVol += pos.Volume();
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| v1.49: trend-flip trim — close winners on the heavier side until  |
+//| BUY-vol ≈ SELL-vol.                                               |
+//|                                                                   |
+//| Triggered from the trend-flip block in RunPartialRecovery() when  |
+//| InpTrendFlipTrimStrong=true.  Idea: under a long-running BUY      |
+//| trend the EA accumulates lots of BUY volume (averagers + leg(s)   |
+//| of the lock + originals).  When the trend reverses, that BUY pile |
+//| now bleeds against the new SELL trend.  We trim the strong side   |
+//| down to match the weak side's net volume so the basket re-enters  |
+//| the new trend with a flatter directional bias.                    |
+//|                                                                   |
+//| Selection: positions on the strong side, sorted by realised+      |
+//| floating PnL DESCENDING (close winners first to lock profit).     |
+//| The last position is partially closed if needed to land exactly   |
+//| on the volume-balance target.                                     |
+//|                                                                   |
+//| Scope: ALL managed positions on the strong side — PR-AVG-*,       |
+//| PR-LOCK-*, originals, AVG-*, GRID-* — per the user's "for all     |
+//| groups" requirement.                                              |
+//|                                                                   |
+//| Returns total lot actually closed (>=0).                          |
+//+------------------------------------------------------------------+
+double TrimStrongSideToWeak()
+  {
+   if(!InpTrendFlipTrimStrong) return 0.0;
+
+   double buyVol = 0.0, sellVol = 0.0;
+   ComputeManagedNetVolumes(buyVol, sellVol);
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+
+   double diff = MathAbs(buyVol - sellVol);
+   if(diff + 1e-9 < minLot)
+     {
+      PrintFormat("PR trim: BUY-vol=%.2f SELL-vol=%.2f diff=%.4f < minLot=%.4f -- nothing to trim",
+                  buyVol, sellVol, diff, minLot);
+      return 0.0;
+     }
+
+   ENUM_POSITION_TYPE strongSide = (buyVol > sellVol) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+   // Collect every managed position on the strong side together with its
+   // PnL (Profit + Swap + Commission) and volume.
+   ulong  tickets[];
+   double profits[];
+   double vols[];
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != strongSide) continue;
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      double v   = pos.Volume();
+      int    n   = ArraySize(tickets);
+      ArrayResize(tickets, n+1);
+      ArrayResize(profits, n+1);
+      ArrayResize(vols,    n+1);
+      tickets[n] = t;
+      profits[n] = pft;
+      vols[n]    = v;
+     }
+   int cnt = ArraySize(tickets);
+   if(cnt == 0) return 0.0;
+
+   // Sort DESCENDING by profit so the call order is winners first.
+   for(int i = 0; i < cnt - 1; i++)
+      for(int j = i + 1; j < cnt; j++)
+         if(profits[j] > profits[i])
+           {
+            double tp = profits[i]; profits[i] = profits[j]; profits[j] = tp;
+            ulong  tt = tickets[i]; tickets[i] = tickets[j]; tickets[j] = tt;
+            double tv = vols[i];    vols[i]    = vols[j];    vols[j]    = tv;
+           }
+
+   double remaining   = diff;
+   double closedTotal = 0.0;
+   for(int i = 0; i < cnt; i++)
+     {
+      if(remaining + 1e-9 < minLot) break;
+
+      double take = MathMin(vols[i], remaining);
+      // round DOWN to broker step
+      take = MathFloor(take / step + 1e-9) * step;
+      if(take + 1e-9 < minLot)
+        {
+         // Can't carve a step-aligned slice; if the whole position is at
+         // minLot (or smaller than step alignment), just close it whole
+         // when remaining still warrants taking the full position.
+         if(vols[i] + 1e-9 >= minLot && remaining + 1e-9 >= vols[i])
+            take = vols[i];
+         else
+            continue;
+        }
+
+      bool ok = false;
+      if(take + 1e-9 >= vols[i])
+        {
+         ok = trade.PositionClose(tickets[i], (ulong)InpSlippage);
+         if(ok)
+           {
+            closedTotal += vols[i];
+            remaining   -= vols[i];
+           }
+        }
+      else
+        {
+         ok = ClosePartOfPosition(tickets[i], take);
+         if(ok)
+           {
+            closedTotal += take;
+            remaining   -= take;
+           }
+        }
+      if(!ok)
+         PrintFormat("PR trim: close #%I64u (%.4f of %.4f) failed err=%d",
+                     tickets[i], take, vols[i], GetLastError());
+     }
+
+   if(closedTotal > 0.0)
+     {
+      PrintFormat("PR trend-flip trim: %s side -%.4f lot (BUY=%.2f SELL=%.2f diff=%.4f, %d candidates)",
+                  strongSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                  closedTotal, buyVol, sellVol, diff, cnt);
+      Notify(StringFormat("PR: trim strong %s side -%.4f lot",
+                          strongSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                          closedTotal));
+      // We may have closed PR-AVG-* tickets — resync the chain counters
+      // by rescanning the book (mirrors the LoadState recompute logic).
+      g_prAvgCountBuy  = 0;
+      g_prAvgCountSell = 0;
+      int posTot = PositionsTotal();
+      for(int i = 0; i < posTot; i++)
+        {
+         ulong tk = PositionGetTicket(i);
+         if(!IsManaged(tk)) continue;
+         string cmt = pos.Comment();
+         if(StringFind(cmt, "PR-AVG-B") >= 0) g_prAvgCountBuy++;
+         if(StringFind(cmt, "PR-AVG-S") >= 0) g_prAvgCountSell++;
+        }
+      if(InpUsePersistence) SaveState();
+     }
+   return closedTotal;
+  }
+
+//+------------------------------------------------------------------+
+//| v1.49: pick the largest in-profit position on the side OPPOSITE  |
+//| to `losingSide` and report how much lot we can mirror-chip from  |
+//| it.  Used by ResolveChipWithBalance() to back the balance flag.  |
+//|                                                                  |
+//| Returns:                                                         |
+//|   ticket of the chosen profitable opposite-side position, or 0   |
+//|   when no candidate has at least minLot of volume in profit.     |
+//|   `grantedLot` = MIN(desiredLot, candidate.Volume), aligned DOWN |
+//|   to broker step; <minLot => returns 0 / grantedLot = 0.         |
+//|                                                                  |
+//| Selection: candidate with the LARGEST volume (so the desiredLot  |
+//| is more likely to be granted in full).  PnL must be > 0.         |
+//+------------------------------------------------------------------+
+ulong PickProfitableOppositeForBalance(const ENUM_POSITION_TYPE losingSide,
+                                       const double             desiredLot,
+                                       double                  &grantedLot)
+  {
+   grantedLot = 0.0;
+   if(desiredLot <= 0) return 0;
+
+   ENUM_POSITION_TYPE profSide = (losingSide == POSITION_TYPE_BUY)
+                                  ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+
+   ulong  best    = 0;
+   double bestVol = 0.0;
+   int    total   = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != profSide) continue;
+      double pft = pos.Profit() + pos.Swap() + pos.Commission();
+      if(pft <= 0) continue;
+      double v = pos.Volume();
+      if(v > bestVol) { bestVol = v; best = t; }
+     }
+   if(best == 0) return 0;
+
+   double cap = MathMin(desiredLot, bestVol);
+   cap = MathFloor(cap / step + 1e-9) * step;
+   if(cap + 1e-9 < minLot) return 0;
+
+   grantedLot = cap;
+   return best;
+  }
+
+//+------------------------------------------------------------------+
+//| v1.49: resolve the chip lot taking the optional balance flag      |
+//| into account.                                                     |
+//|                                                                   |
+//| Without InpBalanceChipFromProfit -> no-op: returns desiredChipLot |
+//| and balanceTicket=0.                                              |
+//|                                                                   |
+//| With InpBalanceChipFromProfit -> looks for a profitable opposite- |
+//| side position via PickProfitableOppositeForBalance():             |
+//|   * partner found w/ lot >= desiredChipLot   => chip = desired,   |
+//|     balanceTicket set, balanceLot = chip.                         |
+//|   * partner found w/ lot <  desiredChipLot   => chip = partner's  |
+//|     granted lot ("режем обе на минимально доступный лот"), both   |
+//|     sides cut equal.                                              |
+//|   * no partner with vol >= minLot            => chip skipped      |
+//|     entirely (returns 0): the balance flag prefers symmetry over  |
+//|     biting into the loser without a counterweight.                |
+//|                                                                   |
+//| The caller is responsible for actually closing the loser by the   |
+//| returned chip lot AND closing balanceTicket by balanceLot AFTER   |
+//| the loser-close succeeds.                                         |
+//+------------------------------------------------------------------+
+double ResolveChipWithBalance(const ulong  loserTicket,
+                              const double desiredChipLot,
+                              ulong       &balanceTicket,
+                              double      &balanceLot)
+  {
+   balanceTicket = 0;
+   balanceLot    = 0.0;
+   if(!InpBalanceChipFromProfit) return desiredChipLot;
+   if(desiredChipLot <= 0)       return 0.0;
+   if(!pos.SelectByTicket(loserTicket)) return 0.0;
+   ENUM_POSITION_TYPE losingSide = pos.PositionType();
+
+   double granted = 0.0;
+   ulong  partner = PickProfitableOppositeForBalance(losingSide, desiredChipLot, granted);
+   if(partner == 0)
+     {
+      PrintFormat("PR balance-chip: skip — no profitable %s position to mirror %.4f lot from #%I64u",
+                  losingSide == POSITION_TYPE_BUY ? "SELL" : "BUY",
+                  desiredChipLot, loserTicket);
+      return 0.0;
+     }
+
+   balanceTicket = partner;
+   balanceLot    = granted;   // both sides equal at the smaller of (desired, partnerVol)
+   return granted;
+  }
+
+//+------------------------------------------------------------------+
 //| basket close.                                                     |
 //|                                                                   |
 //| Why: v1.46/1.47 only "ate" the loser inside ProcessProfitableAver-|
@@ -3174,13 +3507,37 @@ void ChipDeepestLoserAfterPRCommonTP(const double budget,
      }
 
    // --- Execute ----------------------------------------------------------
+   // v1.49: if InpBalanceChipFromProfit is on, look up an opposite-side
+   // profitable position to mirror the chip.  No partner -> skip the
+   // chip entirely (realised profit just stays on balance, identical to
+   // the no-loser case above).
+   ulong  balT = 0;
+   double balL = 0.0;
+   double effChip = ResolveChipWithBalance(target, chipLot, balT, balL);
+   if(effChip <= 0)
+     {
+      PrintFormat("PR common-TP chip: skipped on #%I64u — balance partner missing", target);
+      return;
+     }
+   chipLot = effChip;
+
    if(ClosePartOfPosition(target, chipLot))
      {
-      PrintFormat("PR common-TP chipped %.4f from #%I64u (budget=%.2f, prio=%d, mode=%s)",
+      PrintFormat("PR common-TP chipped %.4f from #%I64u (budget=%.2f, prio=%d, mode=%s%s)",
                   chipLot, target, budget, (int)InpRecoveryPriority,
-                  InpEnsureNetPositive ? "net+" : "fixed");
+                  InpEnsureNetPositive ? "net+" : "fixed",
+                  balT != 0 ? " bal+" : "");
       Notify(StringFormat("PR common-TP chip: -%.4f from #%I64u (budget +%.2f)",
                           chipLot, target, budget));
+      if(balT != 0)
+        {
+         if(ClosePartOfPosition(balT, balL))
+            PrintFormat("PR common-TP balance-chip %.4f from profitable #%I64u (mirrors #%I64u)",
+                        balL, balT, target);
+         else
+            PrintFormat("PR common-TP balance-chip on #%I64u FAILED — net exposure shifted by %.4f",
+                        balT, chipLot);
+        }
      }
   }
 
