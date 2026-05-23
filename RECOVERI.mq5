@@ -1,7 +1,41 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.47                                                           |
+//|  v1.48                                                           |
+//|  Добавлено в v1.48 (Mode 5 — общий ТП откусывает чип от убытка): |
+//|    - Фикс жалобы пользователя «после v1.47 перестало откусывать  |
+//|      чип»: до 1.47 убыточник «съедался» только в                 |
+//|      ProcessProfitableAveragers (закрыть прибыльный PR-AVG +     |
+//|      откусить InpPartCloseLot от худшего убыточника). v1.47      |
+//|      приостановил per-avg TP+chip, как только цепочка дорастает  |
+//|      до InpPRCommonTPCount, чтобы общий ТП успел сработать. Но   |
+//|      сам общий ТП в CheckPRCommonTP только закрывал цепочку и    |
+//|      клал реализованный профит на баланс — исходный убыточник    |
+//|      не сокращался, и каждый цикл «закрылась корзина → открылась |
+//|      новая» возвращал ту же убыточную позицию.                   |
+//|      Теперь после каждого срабатывания общего ТП                 |
+//|      (денежного или ценового, на сторону) советник:              |
+//|        1) суммирует реализованный профит ИМЕННО закрытых         |
+//|           PR-AVG (Profit+Swap+Commission на момент закрытия,     |
+//|           только по успешно закрытым тикетам — failed-close      |
+//|           автоматически игнорируется);                           |
+//|        2) откусывает ОДИН большой чип от самого глубокого        |
+//|           исходного убыточника лотом, подобранным так, чтобы     |
+//|           реализованная пара (профит цепочки + убыток на чипе)   |
+//|           осталась >= InpMinNetProfit (при InpEnsureNetPositive).|
+//|      Логика выбора стороны убыточника: ценовой ТП BUY-цепочки → |
+//|      чип со стороны SELL-убыточников (опираясь на «BUY            |
+//|      зарабатывает = SELL терпит»), ценовой ТП SELL → BUY          |
+//|      убыточники. Денежный ТП закрывает обе стороны → чип со      |
+//|      стороны самого глубокого убыточника, неважно BUY или SELL.  |
+//|      Если убыточников больше нет / минимальный лот не помещается |
+//|      в бюджет — чип молча пропускается и профит просто остаётся  |
+//|      на балансе (так же как в ProcessProfitableAveragers).       |
+//|      Управляется ключом InpPRCommonTPChipLoser (по умолчанию     |
+//|      true). Поставив false, можно вернуть v1.47-поведение, когда |
+//|      общий ТП только закрывает цепочку и не трогает убыточник.   |
+//|      InpEnsureNetPositive / InpMinNetProfit / InpPartCloseLot    |
+//|      применяются единообразно с per-averager-чипом.              |
 //|  Добавлено в v1.47 (Mode 5 — приоритет общего ТП над per-avg):   |
 //|    - Фикс поведения, на которое жаловался пользователь:          |
 //|      «Mode 5 неправильно строит сетку — каждый усреднитель       |
@@ -153,9 +187,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.47"
+#property version   "1.48"
 #property strict
-#property description "Universal MT5 Recovery EA v1.47 - Mode 5: common TP suspends per-averager TP+chip once chain reaches threshold"
+#property description "Universal MT5 Recovery EA v1.48 - Mode 5: common TP also chips a piece off the deepest loser using the basket's realized profit"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -336,6 +370,7 @@ input int                InpPRCommonTPCount        = 5;              // Mode5: �
 input int                InpPRCommonTPPts          = 50;             // Mode5: общий ТП от средневзв. цены PR-AVG (пункты, на сторону; 0=выкл)
 input double             InpPRCommonTPMoney        = 0.0;            // Mode5: общий ТП по сумме PnL всей цепочки PR-AVG (валюта депо; 0=выкл)
 input bool               InpPRCommonTPSuspendsAvgTP = true;          // Mode5: при достижении порога приостанавливать per-avg TP+chip и overlap (true=v1.47, false=v1.46 параллельно)
+input bool               InpPRCommonTPChipLoser     = true;          // Mode5 v1.48: после общего ТП откусывать чип от глубочайшего убыточника на реализованный профит (false=только закрыть цепочку)
 
 input group "=== Тренд-фильтр для усреднителей ==="
 input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
@@ -1852,6 +1887,11 @@ void DoPartialRecovery(const BasketState &bs)
    //          common TP without being dismantled piece by piece.
    //          CheckPRCommonTP() (called earlier in OnTick before
    //          BuildBasket) handles the basket close when armed.
+   //--- v1.48: when CheckPRCommonTP fires, it also chips ONE big slice
+   //          off the deepest losing original (funded by the chain's
+   //          realised profit), so suspending per-averager TP+chip no
+   //          longer means "loser stops shrinking" — the loser is now
+   //          chipped at chain scope instead of per-averager scope.
    int  prAvgOpen     = CountPRAveragers();
    bool commonTPArmed = (InpPRCommonTPCount > 0
                         && (InpPRCommonTPPts > 0 || InpPRCommonTPMoney > 0)
@@ -3016,6 +3056,135 @@ int CountPRAveragers()
   }
 
 //+------------------------------------------------------------------+
+//| v1.48: chip the deepest losing original after a CheckPRCommonTP() |
+//| basket close.                                                     |
+//|                                                                   |
+//| Why: v1.46/1.47 only "ate" the loser inside ProcessProfitableAver-|
+//| agers (per-averager TP + InpPartCloseLot chip).  v1.47 SUSPENDS   |
+//| that path once the chain reaches InpPRCommonTPCount, so the loser |
+//| stopped shrinking — common TP just closed the chain and parked    |
+//| profit on balance.  v1.48 restores the realised-profit-funds-     |
+//| realised-loss accounting at chain scope: after the common TP      |
+//| pockets `budget` USD, we immediately chip the deepest losing      |
+//| ORIGINAL (not PR-AVG, not PR-LOCK) by a lot sized to keep         |
+//|   realised profit + chip-realised loss >= InpMinNetProfit         |
+//| when InpEnsureNetPositive=true; otherwise a fixed InpPartCloseLot.|
+//|                                                                   |
+//| preferLoserSide:                                                  |
+//|   0 = any  - pick the deepest loser regardless of side (used by   |
+//|              the money trigger which closes both BUY+SELL avg).   |
+//|   1 = BUY  - pick the worst BUY loser first, fall back to SELL.   |
+//|              Used after SELL chain closed (price went down ->     |
+//|              BUY originals are the ones losing).                  |
+//|   2 = SELL - pick the worst SELL loser first, fall back to BUY.   |
+//|              Used after BUY chain closed (price went up ->        |
+//|              SELL originals are the ones losing).                 |
+//|                                                                   |
+//| If no losers remain, or even the broker's minLot won't fit in the |
+//| budget without breaching InpMinNetProfit, the chip is skipped     |
+//| silently and the realised profit just stays on balance — same     |
+//| accounting convention as ProcessProfitableAveragers.              |
+//+------------------------------------------------------------------+
+void ChipDeepestLoserAfterPRCommonTP(const double budget,
+                                     const int    preferLoserSide)
+  {
+   if(!InpPRCommonTPChipLoser) return;
+   if(budget <= 0)
+     {
+      PrintFormat("PR common-TP chip skipped — non-positive budget %.2f", budget);
+      return;
+     }
+
+   // --- Pick a target ----------------------------------------------------
+   ulong target = 0;
+   if(preferLoserSide == 1)
+     {
+      target = PickLosingTicket(POSITION_TYPE_BUY);
+      if(target == 0) target = PickLosingTicket(POSITION_TYPE_SELL);
+     }
+   else if(preferLoserSide == 2)
+     {
+      target = PickLosingTicket(POSITION_TYPE_SELL);
+      if(target == 0) target = PickLosingTicket(POSITION_TYPE_BUY);
+     }
+   else
+     {
+      // 0 = any: pick the deepest loser of either side.
+      ulong  tb = PickLosingTicket(POSITION_TYPE_BUY);
+      ulong  ts = PickLosingTicket(POSITION_TYPE_SELL);
+      double pb = 0, ps = 0;
+      if(tb != 0 && pos.SelectByTicket(tb))
+         pb = pos.Profit() + pos.Swap() + pos.Commission();
+      if(ts != 0 && pos.SelectByTicket(ts))
+         ps = pos.Profit() + pos.Swap() + pos.Commission();
+      if(tb != 0 && ts != 0)
+         target = (pb < ps) ? tb : ts;   // more negative = deeper
+      else
+         target = (tb != 0) ? tb : ts;
+     }
+
+   if(target == 0)
+     {
+      Print("PR common-TP chip: no losing originals to chip");
+      return;
+     }
+   if(!pos.SelectByTicket(target)) return;
+
+   double tgtVol = pos.Volume();
+   double tgtPnL = pos.Profit() + pos.Swap() + pos.Commission();
+   if(tgtVol <= 0 || tgtPnL >= 0)
+     {
+      Print("PR common-TP chip: target not in loss anymore");
+      return;
+     }
+
+   // --- Size the chip ----------------------------------------------------
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
+
+   double chipLot = 0.0;
+   if(InpEnsureNetPositive)
+     {
+      double pnlPerLot = tgtPnL / tgtVol;          // <0 ($/lot)
+      double headroom  = budget - InpMinNetProfit;
+      if(headroom <= 0)
+        {
+         PrintFormat("PR common-TP chip skipped — budget %.2f <= floor %.2f",
+                     budget, InpMinNetProfit);
+         return;
+        }
+      double maxChip = headroom / MathAbs(pnlPerLot);
+      chipLot = MathMin(tgtVol, maxChip);
+      chipLot = MathFloor(chipLot / step + 1e-9) * step;
+      if(chipLot + 1e-9 < minLot)
+        {
+         PrintFormat("PR common-TP chip skipped — chip %.4f < minLot %.4f "
+                     "(budget %.2f, per-lot loss %.2f)",
+                     chipLot, minLot, budget, pnlPerLot);
+         return;
+        }
+     }
+   else
+     {
+      // Legacy path: fixed slice per common-TP cycle.
+      chipLot = MathMin(tgtVol, InpPartCloseLot);
+      chipLot = MathFloor(chipLot / step + 1e-9) * step;
+      if(chipLot + 1e-9 < minLot) chipLot = minLot;
+     }
+
+   // --- Execute ----------------------------------------------------------
+   if(ClosePartOfPosition(target, chipLot))
+     {
+      PrintFormat("PR common-TP chipped %.4f from #%I64u (budget=%.2f, prio=%d, mode=%s)",
+                  chipLot, target, budget, (int)InpRecoveryPriority,
+                  InpEnsureNetPositive ? "net+" : "fixed");
+      Notify(StringFormat("PR common-TP chip: -%.4f from #%I64u (budget +%.2f)",
+                          chipLot, target, budget));
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| v1.46: Common TP for Mode 5 (Partial Recovery) averager chain.   |
 //|                                                                  |
 //| Direct analogue of v1.45 CheckGridCommonTP() but applied to the  |
@@ -3031,11 +3200,20 @@ int CountPRAveragers()
 //| zero — same convention as ProcessProfitableAveragers and         |
 //| TryCloseOldGridByProfit.                                         |
 //|                                                                  |
+//| v1.48: after each successful close path we feed the realised     |
+//| profit into ChipDeepestLoserAfterPRCommonTP() to bite ONE big    |
+//| chip off the deepest losing original on the appropriate side.    |
+//| Realised profit = sum of (Profit+Swap+Commission) of TICKETS WE  |
+//| ACTUALLY CLOSED in this pass (failed closes don't fund the chip).|
+//|                                                                  |
 //| PR-LOCK, original losers, and any non-PR-AVG-* positions are NOT |
-//| touched here.  Coexists with the per-averager TP+chip path in    |
-//| ProcessProfitableAveragers: that one fires when an INDIVIDUAL    |
-//| averager is in profit by InpAvgTPpts; this one fires when the    |
-//| chain AS A WHOLE is in profit by the configured budget.          |
+//| themselves identified as part of the chain here.  Coexists with  |
+//| the per-averager TP+chip path in ProcessProfitableAveragers:     |
+//| that one fires when an INDIVIDUAL averager is in profit by       |
+//| InpAvgTPpts; this one fires when the chain AS A WHOLE is in      |
+//| profit by the configured budget, and (v1.48) the chip is one     |
+//| large slice funded by the whole chain rather than one InpPart-   |
+//| CloseLot per averager.                                           |
 //+------------------------------------------------------------------+
 void CheckPRCommonTP()
   {
@@ -3079,21 +3257,38 @@ void CheckPRCommonTP()
                   totalAvg, totalPnL, InpPRCommonTPMoney);
       Notify(StringFormat("PR common TP $ hit: %.2f >= %.2f, closing %d averagers",
                           totalPnL, InpPRCommonTPMoney, totalAvg));
-      int closedB = 0, closedS = 0;
+      // v1.48: realised PnL is the sum of (Profit+Swap+Commission) of the
+      // tickets we ACTUALLY closed in this pass — failed closes don't fund
+      // the chip.  Re-select each ticket BEFORE PositionClose so we read
+      // its live PnL at close time (not the pre-loop snapshot).
+      int    closedB = 0, closedS = 0;
+      double realisedPnL = 0.0;
       for(int i = 0; i < ArraySize(buyT); i++)
         {
-         if(trade.PositionClose(buyT[i], (ulong)InpSlippage)) closedB++;
+         double thisPnL = 0.0;
+         if(pos.SelectByTicket(buyT[i]))
+            thisPnL = pos.Profit() + pos.Swap() + pos.Commission();
+         if(trade.PositionClose(buyT[i], (ulong)InpSlippage))
+           { closedB++; realisedPnL += thisPnL; }
          else PrintFormat("PR common-TP close BUY #%I64u err=%d",
                           buyT[i], trade.ResultRetcode());
         }
       for(int i = 0; i < ArraySize(sellT); i++)
         {
-         if(trade.PositionClose(sellT[i], (ulong)InpSlippage)) closedS++;
+         double thisPnL = 0.0;
+         if(pos.SelectByTicket(sellT[i]))
+            thisPnL = pos.Profit() + pos.Swap() + pos.Commission();
+         if(trade.PositionClose(sellT[i], (ulong)InpSlippage))
+           { closedS++; realisedPnL += thisPnL; }
          else PrintFormat("PR common-TP close SELL #%I64u err=%d",
                           sellT[i], trade.ResultRetcode());
         }
       g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy  - closedB);
       g_prAvgCountSell = MathMax(0, g_prAvgCountSell - closedS);
+      // v1.48: chip the deepest loser of EITHER side with the realised
+      // basket profit as budget.  preferLoserSide=0 means "deepest of
+      // BUY+SELL", which matches the money trigger (closed both sides).
+      ChipDeepestLoserAfterPRCommonTP(realisedPnL, 0);
       return;
      }
 
@@ -3116,14 +3311,23 @@ void CheckPRCommonTP()
                      ArraySize(buyT), wavg, target, bid);
          Notify(StringFormat("PR common TP BUY hit: %d averagers @ %.5f (WAvg=%.5f +%dpts)",
                              ArraySize(buyT), bid, wavg, InpPRCommonTPPts));
-         int closed = 0;
+         int    closed = 0;
+         double realisedPnL = 0.0;
          for(int i = 0; i < ArraySize(buyT); i++)
            {
-            if(trade.PositionClose(buyT[i], (ulong)InpSlippage)) closed++;
+            double thisPnL = 0.0;
+            if(pos.SelectByTicket(buyT[i]))
+               thisPnL = pos.Profit() + pos.Swap() + pos.Commission();
+            if(trade.PositionClose(buyT[i], (ulong)InpSlippage))
+              { closed++; realisedPnL += thisPnL; }
             else PrintFormat("PR common-TP close BUY #%I64u err=%d",
                              buyT[i], trade.ResultRetcode());
            }
          g_prAvgCountBuy = MathMax(0, g_prAvgCountBuy - closed);
+         // v1.48: BUY chain profited because price went UP -> the SELL
+         // originals were the ones losing money.  Chip from the worst
+         // SELL loser; fall back to BUY losers if none on SELL side.
+         ChipDeepestLoserAfterPRCommonTP(realisedPnL, 2);
         }
      }
 
@@ -3137,14 +3341,23 @@ void CheckPRCommonTP()
                      ArraySize(sellT), wavg, target, ask);
          Notify(StringFormat("PR common TP SELL hit: %d averagers @ %.5f (WAvg=%.5f -%dpts)",
                              ArraySize(sellT), ask, wavg, InpPRCommonTPPts));
-         int closed = 0;
+         int    closed = 0;
+         double realisedPnL = 0.0;
          for(int i = 0; i < ArraySize(sellT); i++)
            {
-            if(trade.PositionClose(sellT[i], (ulong)InpSlippage)) closed++;
+            double thisPnL = 0.0;
+            if(pos.SelectByTicket(sellT[i]))
+               thisPnL = pos.Profit() + pos.Swap() + pos.Commission();
+            if(trade.PositionClose(sellT[i], (ulong)InpSlippage))
+              { closed++; realisedPnL += thisPnL; }
             else PrintFormat("PR common-TP close SELL #%I64u err=%d",
                              sellT[i], trade.ResultRetcode());
            }
          g_prAvgCountSell = MathMax(0, g_prAvgCountSell - closed);
+         // v1.48: SELL chain profited because price went DOWN -> the BUY
+         // originals were the ones losing money.  Chip from the worst
+         // BUY loser; fall back to SELL losers if none on BUY side.
+         ChipDeepestLoserAfterPRCommonTP(realisedPnL, 1);
         }
      }
   }
