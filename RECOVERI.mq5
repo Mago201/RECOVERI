@@ -1,7 +1,25 @@
 ﻿//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.44                                                           |
+//|  v1.50                                                           |
+//|  Добавлено в v1.50 (Mode 5 — Partial Recovery):                  |
+//|    - Опциональное выравнивание объёмов на смене тренда:          |
+//|      InpTrendFlipTrimStrong (по умолчанию false). Когда флипнул  |
+//|      тренд-фильтр, советник считает суммарный объём всех         |
+//|      managed-позиций раздельно по BUY/SELL (включая PR-AVG-*,    |
+//|      PR-LOCK-*, исходные ручные/убыточные ордера, AVG-*, GRID-*) |
+//|      и, если разница превышает minLot брокера, режет «сильную»  |
+//|      сторону до объёма «слабой». На срезаемой стороне сначала    |
+//|      закрываются позиции с наибольшим PnL (фиксируется прибыль   |
+//|      раньше, чем убытки). Последняя позиция при необходимости    |
+//|      закрывается частично, чтобы выйти ровно на нужный объём.    |
+//|      После trim-а g_prAvgCount{Buy,Sell} пересчитываются скан-   |
+//|      ом, при включённой persistence — сохраняется состояние.    |
+//|      Работает совместно с InpRestartGridOnTrendFlip (рестарт     |
+//|      счётчиков на новой стороне) и InpCloseOldGridOnTrendFlip   |
+//|      (флуш старых PR-AVG по профиту корзинно): trim делает       |
+//|      разовое выравнивание на флипе, остальные ключи продолжают  |
+//|      применяться к оставшейся PR-AVG-цепочке.                    |
 //|  Добавлено в v1.44 (Mode 5 — Partial Recovery):                  |
 //|    - Закрытие старой сетки усреднителей по профиту при смене     |
 //|      тренда. До 1.43 при флипе тренда счётчик усреднителей       |
@@ -98,9 +116,9 @@
 //|    - Фильтры по времени и экономкалендарю MT5                    |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.44"
+#property version   "1.50"
 #property strict
-#property description "Universal MT5 Recovery EA v1.44 - Mode5 close old PR-AVG grid by profit on trend flip"
+#property description "Universal MT5 Recovery EA v1.50 - Mode5 trend-flip optional trim of strong side to weak"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -277,6 +295,7 @@ input double             InpMinNetProfit      = 0.0;                 // Mode5: �
 input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
 input bool               InpCloseOldGridOnTrendFlip = true;          // Mode5: при смене тренда закрывать старую сетку усреднителей по профиту корзинно
 input double             InpOldGridCloseProfit     = 0.0;            // Mode5: мин. суммарный профит старой сетки для её закрытия (валюта депо, >=0)
+input bool               InpTrendFlipTrimStrong    = false;          // Mode5: при смене тренда выравнивать сильную сторону под слабую (закрывает позиции с наибольшим PnL первыми, по всем managed-группам)
 
 input group "=== Тренд-фильтр для усреднителей ==="
 input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
@@ -512,7 +531,7 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.44 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.50 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
                (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
    return INIT_SUCCEEDED;
@@ -1749,6 +1768,13 @@ void DoPartialRecovery(const BasketState &bs)
                              g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"));
         }
 
+      // v1.50: optional one-shot trim of the heavier side down to the
+      // lighter side across ALL managed groups (PR-AVG, PR-LOCK,
+      // originals, AVG-*, GRID-*).  Closes most-profitable positions
+      // first.  Runs independently of the two flags above.
+      if(InpTrendFlipTrimStrong)
+         TrimStrongSideToWeak();
+
       if(InpUsePersistence) SaveState();
      }
    if(trend != 0) g_prLastTrend = trend;
@@ -1905,6 +1931,159 @@ void TryCloseOldGridByProfit()
                        g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
                        closed, sum));
    g_prCloseOldActive = false;
+   if(InpUsePersistence) SaveState();
+  }
+
+//+------------------------------------------------------------------+
+//| Sum total volume of ALL managed positions, separately for each   |
+//| direction.  Counts every group the EA considers managed: PR-AVG, |
+//| PR-LOCK, originals (no PR-* tag), AVG-*, GRID-*, MANUAL-LOCK,    |
+//| etc.  Used by TrimStrongSideToWeak to decide how much volume to  |
+//| trim off the heavier side at trend-flip time.                    |
+//+------------------------------------------------------------------+
+void ComputeManagedNetVolumes(double &buyVol, double &sellVol)
+  {
+   buyVol  = 0.0;
+   sellVol = 0.0;
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;                       // also selects pos
+      double v = pos.Volume();
+      if(pos.PositionType() == POSITION_TYPE_BUY)       buyVol  += v;
+      else if(pos.PositionType() == POSITION_TYPE_SELL) sellVol += v;
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| TrimStrongSideToWeak (v1.50).                                     |
+//| Called once at trend-flip time when InpTrendFlipTrimStrong=true. |
+//| Determines the heavier side across ALL managed groups and closes |
+//| (fully or partially) positions on that side -- starting with the |
+//| most-profitable -- until the heavier side matches the lighter   |
+//| side in volume.  Coexists with InpRestartGridOnTrendFlip and    |
+//| InpCloseOldGridOnTrendFlip; trim is one-shot, the other flags   |
+//| keep operating on whatever PR-AVG-* survives.                    |
+//|                                                                  |
+//| Notes:                                                           |
+//|   * Sorts strong-side tickets by (Profit+Swap+Commission) DESC,  |
+//|     so winners are realised first.  Negative-PnL positions are   |
+//|     only touched if winners alone aren't enough to cover diff.  |
+//|   * The last position is partial-closed via ClosePartOfPosition  |
+//|     to land exactly on the matching volume.                      |
+//|   * After the trim we rescan PositionsTotal() to recompute       |
+//|     g_prAvgCount{Buy,Sell} (the trim may have closed PR-AVG-*    |
+//|     entries) and persist if InpUsePersistence is on.             |
+//+------------------------------------------------------------------+
+void TrimStrongSideToWeak()
+  {
+   double buyVol, sellVol;
+   ComputeManagedNetVolumes(buyVol, sellVol);
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double diff   = MathAbs(buyVol - sellVol);
+   if(diff < minLot) return;                            // already balanced enough
+
+   ENUM_POSITION_TYPE strong = (buyVol > sellVol) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+
+   // Collect strong-side tickets with their PnL ----------------------
+   ulong  tickets[];
+   double profits[];
+   int total = PositionsTotal();
+   for(int i = 0; i < total; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      if(pos.PositionType() != strong) continue;
+      double pnl = pos.Profit() + pos.Swap() + pos.Commission();
+      int n = ArraySize(tickets);
+      ArrayResize(tickets, n + 1);
+      ArrayResize(profits, n + 1);
+      tickets[n] = t;
+      profits[n] = pnl;
+     }
+
+   int N = ArraySize(tickets);
+   if(N == 0) return;
+
+   // Sort DESC by PnL (most profitable first) ------------------------
+   for(int a = 0; a < N - 1; a++)
+      for(int b = a + 1; b < N; b++)
+         if(profits[b] > profits[a])
+           {
+            double tp = profits[a]; profits[a] = profits[b]; profits[b] = tp;
+            ulong  tt = tickets[a]; tickets[a] = tickets[b]; tickets[b] = tt;
+           }
+
+   double remaining   = diff;
+   int    closedFull  = 0;
+   int    closedPart  = 0;
+   double closedVolTotal = 0.0;
+
+   for(int i = 0; i < N && remaining >= minLot; i++)
+     {
+      if(!pos.SelectByTicket(tickets[i])) continue;
+      double posVol = pos.Volume();
+
+      if(posVol <= remaining + 1e-9)
+        {
+         // Full close
+         if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
+           {
+            closedFull++;
+            closedVolTotal += posVol;
+            remaining      -= posVol;
+           }
+         else
+           {
+            PrintFormat("PR trim: PositionClose #%I64u failed err=%d ret=%d",
+                        tickets[i], GetLastError(), trade.ResultRetcode());
+           }
+        }
+      else
+        {
+         // Partial close to hit exact volume
+         if(ClosePartOfPosition(tickets[i], remaining))
+           {
+            closedPart++;
+            closedVolTotal += remaining;
+            remaining       = 0.0;
+           }
+         else
+           {
+            PrintFormat("PR trim: ClosePartOfPosition #%I64u %.4f failed",
+                        tickets[i], remaining);
+           }
+        }
+     }
+
+   if(closedFull == 0 && closedPart == 0) return;       // nothing actually closed
+
+   // Recount PR-AVG positions after trim (counters can drift) -------
+   int avgB = 0, avgS = 0;
+   int t2 = PositionsTotal();
+   for(int i = 0; i < t2; i++)
+     {
+      ulong t = PositionGetTicket(i);
+      if(!IsManaged(t)) continue;
+      string cmt = pos.Comment();
+      if(StringFind(cmt, "PR-AVG-B") >= 0)      avgB++;
+      else if(StringFind(cmt, "PR-AVG-S") >= 0) avgS++;
+     }
+   g_prAvgCountBuy  = avgB;
+   g_prAvgCountSell = avgS;
+
+   PrintFormat("PR trend-flip trim: %s side -%.4f lot (%d full, %d partial), "
+               "vols after expected ~ %.4f / %.4f",
+               strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
+               closedVolTotal, closedFull, closedPart,
+               (strong == POSITION_TYPE_BUY ? buyVol  - closedVolTotal : buyVol),
+               (strong == POSITION_TYPE_SELL ? sellVol - closedVolTotal : sellVol));
+   Notify(StringFormat("PR trim strong %s -%.4f lot",
+                       strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                       closedVolTotal));
+
    if(InpUsePersistence) SaveState();
   }
 
@@ -2166,7 +2345,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.43 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.50 ULTIMATE ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
