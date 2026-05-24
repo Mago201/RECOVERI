@@ -1,194 +1,62 @@
 ﻿//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
 //|                                                     RECOVERI.mq5 |
 //|                       Universal MT5 Account Recovery EA          |
-//|  v1.53                                                           |
-//|  Добавлено в v1.53 (Mode 5 — параллельные сетки на смене тренда):|
-//|    - InpKeepOldGridAlive (по умолчанию false). Когда тренд-      |
-//|      фильтр флипает, старая сетка усреднителей НЕ трогается:     |
-//|      ни корзинного флуша по InpCloseOldGridOnTrendFlip, ни       |
-//|      одноразового trim лока (InpTrendFlipTrimStrong). Старые     |
-//|      PR-AVG-* спокойно дозакрываются по своим InpAvgTPpts +      |
-//|      штатному «чипу убыточника» в ProcessProfitableAveragers.    |
-//|      Новая сетка по текущему тренду стартует и работает          |
-//|      параллельно в обычном режиме — никакого «мёртвого хвоста»   |
-//|      и принудительного обрыва старого цикла.                     |
-//|    - InpSeedNewGridLot (по умолчанию false). Когда флип тренда   |
-//|      случается, советник запоминает лот ПОСЛЕДНЕГО усреднителя   |
-//|      на «уходящей» стороне (LastAveragerLot для PR-AVG-B/-S) и   |
-//|      использует его как БАЗОВЫЙ лот для НОВОЙ стороны вместо     |
-//|      InpAvgVolume. Множитель InpAvgVolumeMul по-прежнему         |
-//|      применяется на каждом следующем шаге. Сид остаётся          |
-//|      армированным до тех пор, пока на чарте есть хоть один       |
-//|      PR-AVG-*; как только обе сетки полностью закрылись          |
-//|      (AnyAveragerOpen() == false), сид авто-разармируется и      |
-//|      base-lot возвращается к InpAvgVolume.                       |
-//|    - Состояние сида сохраняется в GV (PR_SLA / PR_SLS / PR_SLT)  |
-//|      и сбрасывается на смене режима / кнопкой Reset State.       |
-//|    - Дефолты обоих ключей = false ⇒ поведение байт-в-байт        |
-//|      совпадает с v1.52, новые механики — opt-in.                 |
-//|  Добавлено в v1.52 (Mode 5 — ATR-сетка + выравнивание лока):     |
-//|    - Шаг сетки усреднителей теперь может рассчитываться от ATR   |
-//|      выбранного таймфрейма. Управление: InpAvgStepUseATR=true,   |
-//|      InpAvgStepATRTF (по умолчанию D1), InpAvgStepATRPeriod (14),|
-//|      InpAvgStepATRMul (множитель ATR, по умолчанию 0.5),          |
-//|      InpAvgStepATRMin (минимум в пунктах — пол на случай тонкого  |
-//|      рынка). Эффективный шаг = ATR(TF, period)/Point * Mul, далее |
-//|      применяется существующий InpAvgStepMul^chainIdx, поэтому     |
-//|      длинные цепочки по-прежнему расходятся. При выключенном      |
-//|      ATR-режиме поведение прежнее (фикс. InpAvgStepPts).          |
-//|    - Периодическое выравнивание лока по выбранному ТФ:           |
-//|      InpLockAlignUseTF=true, InpLockAlignTF (D1), InpLockAlign-  |
-//|      ThresholdLot (мин. перевес в лотах для срабатывания),       |
-//|      InpLockAlignOnlyProfit (true = срезать только из «+зоны»).  |
-//|      Раз в новый бар выбранного ТФ советник суммирует BUY/SELL   |
-//|      объёмы по всем managed-позициям, определяет «тяжёлую»       |
-//|      сторону (перевес), и откусывает её до объёма противоположной|
-//|      — закрывая в первую очередь самые ПРИБЫЛЬНЫЕ позиции на     |
-//|      этой стороне (фиксируем «положительную зону»). Если         |
-//|      InpLockAlignOnlyProfit=false и в плюсе на тяжёлой стороне   |
-//|      позиций нет, добор идёт по DESC-PnL (наименее убыточные).   |
-//|      Работает в Mode 3 (HedgeLock) и Mode 5 (PartialRecovery),   |
-//|      гейтится один раз на бар выбранного ТФ.                     |
-//|  Добавлено в v1.51 (фикс Mode 5 — trend-flip trim):              |
-//|    - Исправлен баг: при смене тренда советник закрывал           |
-//|      локирующий ордер целиком (или гораздо больше, чем нужно),   |
-//|      потому что TrimStrongSideToWeak() считал имбаланс ПО ВСЕМ   |
-//|      managed-позициям (PR-AVG, PR-LOCK, оригиналы) и сортировал  |
-//|      срезаемую сторону по PnL DESC. Лок обычно имеет наибольший  |
-//|      абсолютный PnL (он крупнее по объёму), поэтому попадал      |
-//|      первым в очередь на закрытие, и забирал на себя весь diff,  |
-//|      включая объём ещё открытых усреднителей. В результате лок   |
-//|      срезался не на величину чипа от убыточника, а на «BUY−SELL  |
-//|      по всем группам».                                           |
-//|    - Теперь trim работает прицельно: считает объём LOCK на одной |
-//|      стороне и объём ОРИГИНАЛЬНЫХ (не-PR-*) позиций на           |
-//|      противоположной стороне, и режет ИМЕННО лок до объёма       |
-//|      оставшегося оригинала. Усреднители (PR-AVG-*) и позиции на  |
-//|      той же стороне, что и лок, в расчёте не участвуют и trim-ом |
-//|      не трогаются — они продолжают закрываться обычным путём     |
-//|      (TP усреднителя + чип убыточника, либо InpCloseOldGridOn-   |
-//|      TrendFlip по корзинному профиту). Пример: SELL 1.0 → 0.8    |
-//|      после чипа, лок BUY 1.0; на флипе лок BUY режется на 0.2 →  |
-//|      остаётся SELL 0.80 / lock BUY 0.80, усреднители целы.       |
-//|    - Если лока нет (или он на обеих сторонах в каких-то          |
-//|      нештатных конфигурациях) — trim ничего не делает.           |
-//|  Добавлено в v1.50 (Mode 5 — Partial Recovery):                  |
-//|    - Опциональное выравнивание объёмов на смене тренда:          |
-//|      InpTrendFlipTrimStrong (по умолчанию false). Когда флипнул  |
-//|      тренд-фильтр, советник считает суммарный объём всех         |
-//|      managed-позиций раздельно по BUY/SELL (включая PR-AVG-*,    |
-//|      PR-LOCK-*, исходные ручные/убыточные ордера, AVG-*, GRID-*) |
-//|      и, если разница превышает minLot брокера, режет «сильную»  |
-//|      сторону до объёма «слабой». На срезаемой стороне сначала    |
-//|      закрываются позиции с наибольшим PnL (фиксируется прибыль   |
-//|      раньше, чем убытки). Последняя позиция при необходимости    |
-//|      закрывается частично, чтобы выйти ровно на нужный объём.    |
-//|      После trim-а g_prAvgCount{Buy,Sell} пересчитываются скан-   |
-//|      ом, при включённой persistence — сохраняется состояние.    |
-//|      Работает совместно с InpRestartGridOnTrendFlip (рестарт     |
-//|      счётчиков на новой стороне) и InpCloseOldGridOnTrendFlip   |
-//|      (флуш старых PR-AVG по профиту корзинно): trim делает       |
-//|      разовое выравнивание на флипе, остальные ключи продолжают  |
-//|      применяться к оставшейся PR-AVG-цепочке.                    |
-//|  Добавлено в v1.44 (Mode 5 — Partial Recovery):                  |
-//|    - Закрытие старой сетки усреднителей по профиту при смене     |
-//|      тренда. До 1.43 при флипе тренда счётчик усреднителей       |
-//|      сбрасывался на новой стороне, а старые PR-AVG-* позиции на  |
-//|      «уходящей» стороне оставались висеть и каждая отрабатывала  |
-//|      свой собственный InpAvgTPpts; пока они ждали, цена уходила  |
-//|      в новую сторону и старая цепочка садилась в ещё больший     |
-//|      минус. Теперь в момент флипа советник «армирует» старую     |
-//|      сторону: на каждом тике суммирует PnL всех PR-AVG-* на той  |
-//|      стороне, и как только сумма пересекает InpOldGridCloseProfit|
-//|      ($, по умолчанию 0) — закрывает их все разом одной корзиной.|
-//|      Если флип повторится до закрытия — сторона переармируется   |
-//|      на новую «старую». Управляется InpCloseOldGridOnTrendFlip   |
-//|      (по умолчанию true) и InpOldGridCloseProfit. Состояние      |
-//|      сохраняется в GV (PR_COA / PR_COS) и сбрасывается на        |
-//|      смене режима / кнопкой Reset State.                         |
-//|  Добавлено в v1.43 (фиксы режима 5 — Partial Recovery):          |
-//|    - Net-positive guard на партиал-закрытии: при срабатывании TP |
-//|      усреднителя (PR-AVG) теперь ЧИП от убыточной позиции        |
-//|      рассчитывается динамически так, чтобы сумма (профит         |
-//|      усреднителя + убыток откушенного куска лока/убыточника)     |
-//|      была >= InpMinNetProfit. Раньше чип был фиксированный       |
-//|      InpPartCloseLot, и при глубоком минусе цикл «закрыть TP +   |
-//|      откусить часть» уходил в минус. Теперь либо чип             |
-//|      уменьшается до безопасного объёма (≥ minLot брокера), либо  |
-//|      чип пропускается и усреднитель просто фиксирует свой        |
-//|      профит. Управляется ключом InpEnsureNetPositive (по         |
-//|      умолчанию true). Старое поведение возвращается              |
-//|      InpEnsureNetPositive=false.                                 |
-//|    - Перезапуск сетки на смене тренда: если включён              |
-//|      InpUseTrendFilter и тренд (быстрая/медленная MA на старшем  |
-//|      ТФ) переворачивается, советник сбрасывает счётчик           |
-//|      усреднителей g_prAvgCount* и one-per-bar-gate на той        |
-//|      стороне, куда теперь идёт тренд, чтобы новая цепочка        |
-//|      усреднителей открылась немедленно (мультипликатор объёма    |
-//|      и шага начнётся с нуля), не дожидаясь шага от последнего    |
-//|      «старого» усреднителя. Управляется InpRestartGridOnTrendFlip|
-//|      (по умолчанию true).                                        |
-//|  Добавлено в v1.42:                                              |
-//|    - Фикс: кнопки панели (BUY/SELL manual, Close All и др.) не   |
-//|      реагировали в Strategy Tester. В MT5 визуальном тестере     |
-//|      OnChartEvent доставляет CHARTEVENT_OBJECT_CLICK ненадёжно.  |
-//|      Добавлен PollPanelButtons() — опрос OBJPROP_STATE кнопок    |
-//|      каждый тик; если кнопка нажата, диспетчеризуем обработчик   |
-//|      через общий HandlePanelClick(). Активно ТОЛЬКО в тестере    |
-//|      (MQL_TESTER=true), в live торговле поведение неизменно.    |
-//|  Добавлено в v1.41:                                              |
-//|    - Защита persistence-state от «застревания» между сменами     |
-//|      режимов: в GV сохраняется отметка MODE; при несовпадении    |
-//|      InpMode с сохранённым — LK_*, PR_PH, RC_TRIG, OEAS_DIS      |
-//|      сбрасываются в дефолты (PAUSED/ESTOP/BE/TSL остаются).      |
-//|    - Кнопка «Reset State» на панели — обнуляет runtime-флаги     |
-//|      (g_lockPhase, g_prPhase, g_recoveryTriggered,               |
-//|      g_otherEAsDisabled, peaks) и стирает соответствующие GV.    |
-//|    - В OnInit() выводится фактический статус загрузки            |
-//|      (clean / loaded / mode-mismatch) для удобства диагностики.  |
-//|  Добавлено в v1.40 ("ULTIMATE"):                                 |
-//|    - Режим MODE_PARTIAL_RECOVERY: лок + усреднители +            |
-//|      ДРОБНОЕ закрытие убыточной позиции (a la AW Recovery).      |
-//|      Каждый прибыльный усреднитель закрывает не только себя, но  |
-//|      и кусок самого убыточного ордера через PositionClosePartial.|
-//|    - Standby-mode: советник стартует только при достижении       |
-//|      просадки (Instant / % / $) — InpStartTrigger.               |
-//|    - Тренд-фильтр для усреднителей (быстрая/медленная MA на      |
-//|      старшем ТФ) — InpUseTrendFilter.                            |
-//|    - One-Per-Bar: не более одного усреднителя на свечу.          |
-//|    - Closing overlap: в длинной цепочке усреднителей закрывается |
-//|      только первый+последний (InpOverlapAfterN).                 |
-//|    - Приоритет обработки в SmartClose/PartialRecovery:           |
-//|      EASY / HARD / FIRST_TICKET.                                 |
-//|    - Email-уведомления (SendMail) дополнительно к Alert/Push.    |
-//|    - Disable other EAs at launch — снять чужие советники с       |
-//|      символа или со всех символов (опционально).                 |
-//|  v1.31:                                                          |
-//|    - Кнопки ручного открытия BUY/SELL на панели                  |
-//|      (для теста стратегии в визуальном режиме и на лайве)        |
-//|    - Все input-параметры переведены на русский                   |
-//|  v1.30:                                                          |
-//|    - Авто-распил (раскулачивание) лока в режиме HedgeLock        |
-//|      Фазы: IDLE -> LOCKED -> UNWOUND -> (RELOCKED) -> ...        |
-//|      Закрытие выгодной ноги по цели/трейлингу                    |
-//|      Опциональное переоткрытие частичного встречного лока        |
-//|    - Валидация InpLockTriggerLoss > 0                            |
-//|    - g_gridPlaced ставится только при реальной установке сетки   |
-//|  v1.20:                                                          |
-//|    - Виртуальный трейлинг-стоп по каждой позиции                 |
-//|    - Уведомления Alert / Sound / Push на ключевые события        |
-//|    - Сохранение состояния через GlobalVariables                  |
-//|    - Безусловная сетка лимитников (BUY_LIMIT/SELL_LIMIT, N уров.)|
-//|  v1.10:                                                          |
-//|    - Закрытие по стороне (BUY/SELL отдельные корзины)            |
-//|    - Виртуальные TP/SL/безубыток по каждой позиции               |
-//|    - Кнопки на панели: Close All / Pause / Lock Now / etc.       |
-//|    - Фильтры по времени и экономкалендарю MT5                    |
+//|  v1.60 — Mode 5 rewrite for AW Recovery alignment                |
+//|                                                                  |
+//|  See docs/MODE5-AW-REWRITE.md for the full design doc.           |
+//|  See CHANGELOG.md for v1.10..v1.53 history.                      |
+//|                                                                  |
+//|  v1.60 highlights (Mode 5 = MODE_PARTIAL_RECOVERY):              |
+//|    * Inputs reorganised under six AW-style sections:             |
+//|        ORDERS TO RECOVERY / LAUNCH / TAKEPROFIT+PARTIAL /        |
+//|        RECOVERY GRIDS / TREND FILTER / PROTECTION.                |
+//|    * Trend-flip handling stack from v1.43–1.53 REMOVED:          |
+//|        InpRestartGridOnTrendFlip, InpCloseOldGridOnTrendFlip,    |
+//|        InpOldGridCloseProfit, InpTrendFlipTrimStrong,            |
+//|        InpKeepOldGridAlive, InpSeedNewGridLot.                   |
+//|        Trend filter now simply blocks new averagers on the wrong |
+//|        side (as in AW Recovery); the old chain dies through its  |
+//|        own InpAvgTPpts and the chip pairing.                     |
+//|    * TF lock-align routine from v1.52 REMOVED:                   |
+//|        InpLockAlignUseTF, InpLockAlignTF,                        |
+//|        InpLockAlignThresholdLot, InpLockAlignOnlyProfit.         |
+//|    * Slow Start: InpUseSlowStart + InpSlowStartLossSteps +       |
+//|        InpSlowStartLossStepUSD gate the maximum number of open   |
+//|        averagers by current floating-loss bucket. Off by default,|
+//|        so legacy behaviour is preserved.                         |
+//|    * Dynamic averager lot: InpAvgLotMode adds                    |
+//|        PCT_OF_LOSING / FROM_LOSS_USD / MAX_OF_ALL options on top |
+//|        of the legacy FIXED mode. FIXED is the default —          |
+//|        v1.53 byte-for-byte behaviour preserved.                  |
+//|    * TP zone visualization: InpDrawTPLine draws an HLINE at the  |
+//|        price where the current basket reaches InpTargetProfit    |
+//|        (recomputed every tick).                                  |
+//|    * Recovery progress %: panel shows                             |
+//|        "Recovery: 67.3%  (-150.00 -> -49.10)" while a cycle is   |
+//|        active. Initial drawdown is captured the first tick after |
+//|        the start trigger fires AND bs.profit < 0.                |
+//|    * Status colour indicator: small rectangle on the panel —     |
+//|        lime=running, gold=standby, orange=paused/blocked,        |
+//|        red=emergency stop, silver=idle/no positions.             |
+//|    * Manual "Avg Now" button (Mode 5 only): opens one PR-AVG     |
+//|        on the side the recovery loop currently prefers, ignoring |
+//|        step/bar gates but respecting MaxAveragers/MaxTrades/     |
+//|        SpreadOK/EmergencyStop. InpShowAvgNowButton.              |
+//|    * KEPT: net-positive guard (InpEnsureNetPositive +            |
+//|        InpMinNetProfit + InpMinNetProfitPct), recovery priority, |
+//|        InpFirstTicket pin, ATR-driven step (InpAvgStepUseATR +   |
+//|        ATR group), closing overlap (InpOverlapAfterN).           |
+//|                                                                  |
+//|  Mode 1/2/3/4 logic and all non-Mode-5 features (HedgeLock auto- |
+//|  unwind, virtual TP/SL/BE/TSL, basket targets, persistence,      |
+//|  unconditional grid, time/news filters, manual BUY/SELL buttons, |
+//|  notifications) are unchanged.                                   |
 //+------------------------------------------------------------------+
 #property copyright "RECOVERI"
-#property version   "1.53"
+#property version   "1.60"
 #property strict
-#property description "Universal MT5 Recovery EA v1.53 - Mode 5: keep-old-grid-alive + seed-new-grid lot on trend flip"
+#property description "Universal MT5 Recovery EA v1.60 - Mode 5 rewritten for AW Recovery alignment (see docs/MODE5-AW-REWRITE.md)"
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -277,6 +145,23 @@ enum ENUM_DISABLE_EAS
    DISABLE_ALL_SYMBOLS = 2    // 2: Выключить советники на всех символах
   };
 
+// v1.60: Mode 5 averager lot sizing strategies.
+//   FIXED         — InpAvgVolume * InpAvgVolumeMul^k (legacy default,
+//                   v1.53 byte-for-byte behaviour).
+//   PCT_OF_LOSING — losingNetVol * InpAvgLotPctOfLosing/100; chain
+//                   multiplier NOT applied (lot already scales w/ loser).
+//   FROM_LOSS_USD — floatingLoss * InpAvgLotPerLossUSD; chain multiplier
+//                   NOT applied (lot already scales w/ floating loss).
+//   MAX_OF_ALL    — max of FIXED, PCT_OF_LOSING, FROM_LOSS_USD;
+//                   chain multiplier IS applied (FIXED contributes).
+enum ENUM_AVG_LOT_MODE
+  {
+   AVG_LOT_FIXED         = 0, // 0: Fixed: InpAvgVolume * Mul^k (легаси)
+   AVG_LOT_PCT_OF_LOSING = 1, // 1: % от объёма убыточной стороны
+   AVG_LOT_FROM_LOSS_USD = 2, // 2: От текущего убытка (лот / $1 убытка)
+   AVG_LOT_MAX_OF_ALL    = 3  // 3: Максимум из FIXED/PCT/FROM_LOSS_USD
+  };
+
 // Internal: result of LoadState() for diagnostic logging in OnInit().
 // Not exposed as input.
 enum ENUM_LOAD_STATUS
@@ -286,165 +171,195 @@ enum ENUM_LOAD_STATUS
    LS_MODE_MISMATCH = 2       // 2: сохранённый mode != InpMode -> mode-specific keys обнулены
   };
 
-//=== Inputs =========================================================
-input group "=== Общие ==="
-input ENUM_RECOVERY_MODE InpMode          = MODE_TARGET_PROFIT;  // Режим восстановления
-input ENUM_MANAGE_SCOPE  InpManageScope   = MANAGE_ALL;          // Какие позиции брать в управление
-input ENUM_SYMBOL_SCOPE  InpSymbolScope   = SCOPE_CURRENT;       // Область по символу
-input long               InpMagic         = 20260520;            // Magic number советника
-input string             InpComment       = "RECOVERI";          // Комментарий к ордерам
-input int                InpSlippage      = 30;                  // Допустимое проскальзывание (пункты)
-input double             InpMaxSpreadPts  = 0;                   // Макс. спред (пункты, 0 = не проверять)
+//=== Inputs (v1.60: 6 AW-Recovery-aligned sections + RECOVERI extras) ====
 
-input group "=== Корзина и цель ==="
-input ENUM_BASKET_MODE   InpBasketMode    = BASKET_COMBINED;     // Режим корзины
-input ENUM_TARGET_TYPE   InpTargetType    = TARGET_MONEY;        // Тип цели
-input double             InpTargetProfit  = 10.0;                // Значение цели
-input bool               InpUseBasketTSL  = false;               // Включить трейлинг корзины
-input double             InpBasketTSLStart= 20.0;                // Старт трейлинга (профит корзины)
-input double             InpBasketTSLStep = 5.0;                 // Откат от пика для закрытия
+// ---------------------------------------------------------------------
+// SECTION 1: ORDERS TO RECOVERY  (AW: ORDERS TO RECOVERY SETTINGS)
+// ---------------------------------------------------------------------
+// Which positions the EA takes under management, recovery priority,
+// and which ticket (if any) to chip first.
+input group "=== ORDERS TO RECOVERY ==="
+input ENUM_RECOVERY_MODE     InpMode             = MODE_TARGET_PROFIT;  // Режим восстановления
+input ENUM_MANAGE_SCOPE      InpManageScope      = MANAGE_ALL;          // Какие позиции брать в управление
+input ENUM_SYMBOL_SCOPE      InpSymbolScope      = SCOPE_CURRENT;       // Область по символу
+input long                   InpMagic            = 20260520;            // Magic number советника
+input string                 InpComment          = "RECOVERI";          // Комментарий к ордерам
+input ENUM_RECOVERY_PRIORITY InpRecoveryPriority = PRIO_HARD;            // Приоритет: какие убыточные ордера обрабатывать первыми
+input ulong                  InpFirstTicket      = 0;                    // Конкретный тикет первым (0=не использовать)
 
-input group "=== Виртуальные TP/SL ==="
-input bool               InpUseVirtualTP  = false;               // Включить виртуальный TP
-input int                InpVirtualTPPts  = 200;                 // Виртуальный TP (пункты)
-input bool               InpUseVirtualSL  = false;               // Включить виртуальный SL
-input int                InpVirtualSLPts  = 1000;                // Виртуальный SL (пункты)
-input bool               InpUseVirtualBE  = false;               // Включить виртуальный безубыток
-input int                InpVirtualBEPts  = 100;                 // Триггер безубытка (пункты)
+// ---------------------------------------------------------------------
+// SECTION 2: LAUNCH SETTINGS  (AW: LAUNCH SETTINGS)
+// ---------------------------------------------------------------------
+// When recovery starts (instant / drawdown%/$ trigger), and what to do
+// with other EAs at launch. v1.60 adds Slow Start (graduated activation).
+input group "=== LAUNCH SETTINGS ==="
+input ENUM_START_TRIGGER     InpStartTrigger       = START_INSTANT;     // Триггер запуска
+input double                 InpStartThreshold     = 100.0;             // Порог: % просадки или сумма ($)
+input bool                   InpAutoResetAfterDone = false;             // Автосброс триггера после восстановления
+input ENUM_DISABLE_EAS       InpDisableOtherEAs    = DISABLE_NONE;      // Снять других ботов при старте recovery
+input bool                   InpUseSlowStart       = false;             // v1.60: ступенчатая активация по углублению просадки
+input int                    InpSlowStartLossSteps = 3;                 // v1.60: число корзин-ступеней (макс. усреднителей растёт по ступеням)
+input double                 InpSlowStartLossStepUSD = 50.0;            // v1.60: углубление убытка ($) на одну ступень
 
-input group "=== Виртуальный трейлинг-стоп (по каждой позиции) ==="
-input bool               InpUseVirtualTSL  = false;              // Включить трейлинг по позициям
-input int                InpVirtualTSLStartPts = 200;            // Профит для активации трейлинга (пункты)
-input int                InpVirtualTSLDistPts  = 100;            // Расстояние трейлинга от пика (пункты)
+// ---------------------------------------------------------------------
+// SECTION 3: TAKEPROFIT AND PARTIAL RECOVERY  (AW: TAKEPROFIT AND PR)
+// ---------------------------------------------------------------------
+// Basket-level target, basket trailing, partial-close geometry,
+// net-positive guard (RECOVERI's killer feature over AW),
+// closing overlap, and TP-zone visualisation on chart.
+input group "=== TAKEPROFIT AND PARTIAL RECOVERY ==="
+input ENUM_BASKET_MODE       InpBasketMode        = BASKET_COMBINED;     // Режим корзины
+input ENUM_TARGET_TYPE       InpTargetType        = TARGET_MONEY;        // Тип цели
+input double                 InpTargetProfit      = 10.0;                // Значение цели
+input bool                   InpUseBasketTSL      = false;               // Включить трейлинг корзины
+input double                 InpBasketTSLStart    = 20.0;                // Старт трейлинга (профит корзины)
+input double                 InpBasketTSLStep     = 5.0;                 // Откат от пика для закрытия
+input double                 InpPartCloseLot      = 0.10;                // Mode5: размер чипа убыточной позиции (лот)
+input int                    InpOverlapAfterN     = 0;                   // Mode5: closing overlap, 0=off, N=>после N оставлять только first+last
+input bool                   InpEnsureNetPositive = true;                // Mode5: гарантировать неотрицательный итог пары (TP усреднителя + чип убыточника)
+input double                 InpMinNetProfit      = 0.0;                 // Mode5: минимальный итог пары в валюте депо (>=0), абсолютный «пол»
+input double                 InpMinNetProfitPct   = 0.0;                 // Mode5: минимальный итог пары в % от прибыли усреднителя (0..100). Эффективный пол = max(InpMinNetProfit, avgProfit*Pct/100)
+input bool                   InpDrawTPLine        = true;                // v1.60: рисовать линию цены TP корзины на графике
+input color                  InpTPLineColor       = clrGold;             // v1.60: цвет линии TP
 
-input group "=== Стратегии (Averaging/Martingale) ==="
-input double             InpStartLot      = 0.01;                // Стартовый лот
-input double             InpLotMultiplier = 1.5;                 // Множитель лота (мартингейл)
-input double             InpLotAdd        = 0.0;                 // Прибавка к лоту (усреднение, 0 = не использовать)
-input int                InpStepPoints    = 300;                 // Базовый шаг сетки (пункты)
-input double             InpStepMultiplier= 1.2;                 // Множитель шага сетки
-input int                InpMaxTrades     = 10;                  // Макс. позиций в корзине
-input double             InpMaxLot        = 1.0;                 // Лимит лота на одну позицию
+// ---------------------------------------------------------------------
+// SECTION 4: RECOVERY GRIDS AND AVERAGE ORDERS  (AW: RECOVERY GRIDS)
+// ---------------------------------------------------------------------
+// Averager geometry (step / TP / max chain / direction), lot sizing
+// (FIXED / PCT_OF_LOSING / FROM_LOSS_USD / MAX_OF_ALL), ATR-driven
+// step (RECOVERI extension over AW).
+input group "=== RECOVERY GRIDS AND AVERAGE ORDERS ==="
+input double                 InpAvgVolume         = 0.15;                // Mode5: объём первого усреднителя FIXED-режима
+input double                 InpAvgVolumeMul      = 1.0;                 // Mode5: множитель объёма усреднителей FIXED/MAX_OF_ALL (>=1)
+input ENUM_AVG_LOT_MODE      InpAvgLotMode        = AVG_LOT_FIXED;       // v1.60: стратегия выбора лота усреднителя
+input double                 InpAvgLotPctOfLosing = 0.0;                 // v1.60: PCT_OF_LOSING — % от объёма убыточной стороны (0=выкл)
+input double                 InpAvgLotPerLossUSD  = 0.0;                 // v1.60: FROM_LOSS_USD — лот на $1 текущего убытка (0=выкл)
+input int                    InpAvgStepPts        = 250;                 // Mode5: шаг сетки усреднителей (пункты)
+input double                 InpAvgStepMul        = 1.2;                 // Mode5: множитель шага усреднителей
+input int                    InpAvgTPpts          = 30;                  // Mode5: TP усреднителя (пункты, должен > 3*spread)
+input int                    InpMaxAveragers      = 15;                  // Mode5: макс. число одновременных усреднителей
+input bool                   InpPRBidirectional   = false;               // Mode5: открывать усреднители в обе стороны
+input bool                   InpAvgStepUseATR     = false;               // Mode5: брать шаг сетки усреднителей из ATR выбранного ТФ
+input ENUM_TIMEFRAMES        InpAvgStepATRTF      = PERIOD_D1;           // Mode5: ТФ для ATR
+input int                    InpAvgStepATRPeriod  = 14;                  // Mode5: период ATR
+input double                 InpAvgStepATRMul     = 0.5;                 // Mode5: множитель ATR (шаг = ATR/Point * Mul, в пунктах)
+input int                    InpAvgStepATRMin     = 100;                 // Mode5: минимум шага в пунктах (пол при тонком рынке/нулевом ATR)
 
-input group "=== HedgeLock ==="
-input double             InpLockTriggerLoss= 50.0;               // Убыток корзины для открытия лока (валюта депо)
-input double             InpLockLotFactor = 1.0;                 // Доля чистого объёма для лока (1.0 = 100%)
+// ---------------------------------------------------------------------
+// SECTION 5: TREND FILTER  (AW: AW TREND PREDICTOR FILTERING)
+// ---------------------------------------------------------------------
+// MA-cross trend filter on a higher TF gates new averagers to the side
+// aligned with trend. v1.60 simplified: no trend-flip handling — when
+// trend reverses, new averagers just stop opening on the now-wrong side
+// and the existing chain dies through its own InpAvgTPpts + chip pairing.
+input group "=== TREND FILTER ==="
+input bool                   InpUseTrendFilter    = false;               // Mode5: включить тренд-фильтр (MA cross на старшем ТФ)
+input ENUM_TIMEFRAMES        InpTrendTF           = PERIOD_H1;           // Mode5: таймфрейм для тренд-фильтра
+input int                    InpTrendFastMA       = 21;                  // Mode5: период быстрой MA
+input int                    InpTrendSlowMA       = 50;                  // Mode5: период медленной MA
+input bool                   InpOneOrderPerBar    = false;               // Mode5: не более одного усреднителя на свечу
 
+// ---------------------------------------------------------------------
+// SECTION 6: PROTECTION SETTINGS  (AW: PROTECTION SETTINGS)
+// ---------------------------------------------------------------------
+// Account-level safety: equity stop, slippage / spread guards,
+// virtual TP/SL/BE/TSL per position, time/news filters, close-only mode.
+input group "=== PROTECTION SETTINGS ==="
+input bool                   InpUseEquityStop     = false;               // Включить аварийный equity-стоп
+input double                 InpEquityStopPct     = 50.0;                // Порог equity (% от баланса)
+input bool                   InpCloseOnly         = false;               // Только закрытие (новые сделки не открывать)
+input int                    InpSlippage          = 30;                  // Допустимое проскальзывание (пункты)
+input double                 InpMaxSpreadPts      = 0;                   // Макс. спред (пункты, 0 = не проверять)
+input int                    InpMaxTrades         = 10;                  // Макс. позиций в корзине
+input double                 InpMaxLot            = 1.0;                 // Лимит лота на одну позицию
+input bool                   InpUseVirtualTP      = false;               // Включить виртуальный TP
+input int                    InpVirtualTPPts      = 200;                 // Виртуальный TP (пункты)
+input bool                   InpUseVirtualSL      = false;               // Включить виртуальный SL
+input int                    InpVirtualSLPts      = 1000;                // Виртуальный SL (пункты)
+input bool                   InpUseVirtualBE      = false;               // Включить виртуальный безубыток
+input int                    InpVirtualBEPts      = 100;                 // Триггер безубытка (пункты)
+input bool                   InpUseVirtualTSL     = false;               // Включить трейлинг по позициям
+input int                    InpVirtualTSLStartPts= 200;                 // Профит для активации трейлинга (пункты)
+input int                    InpVirtualTSLDistPts = 100;                 // Расстояние трейлинга от пика (пункты)
+input bool                   InpUseTimeFilter     = false;               // Включить фильтр времени
+input int                    InpStartHour         = 0;                   // Начало торгового окна (час 0..24)
+input int                    InpEndHour           = 24;                  // Конец торгового окна (час 0..24)
+input bool                   InpTradeMon          = true;                // Понедельник
+input bool                   InpTradeTue          = true;                // Вторник
+input bool                   InpTradeWed          = true;                // Среда
+input bool                   InpTradeThu          = true;                // Четверг
+input bool                   InpTradeFri          = true;                // Пятница
+input bool                   InpTradeSat          = false;               // Суббота
+input bool                   InpTradeSun          = false;               // Воскресенье
+input bool                   InpUseNewsFilter     = false;               // Включить новостной фильтр (MT5 Calendar)
+input bool                   InpNewsHigh          = true;                // Блокировать события High
+input bool                   InpNewsMedium        = false;               // Блокировать события Medium
+input bool                   InpNewsLow           = false;               // Блокировать события Low
+input int                    InpNewsMinsBefore    = 30;                  // Минут до события
+input int                    InpNewsMinsAfter     = 30;                  // Минут после события
 
-input group "=== Авто-распил лока (Mode 3) ==="
-input bool               InpAutoUnlock          = false;   // Включить авто-распил после лока
-input double             InpUnlockProfitUSD     = 30.0;    // Профит ОДНОЙ ноги для её закрытия (валюта депо)
-input bool               InpUseSideTSL          = true;    // Трейлинг профита ноги при распиле
-input double             InpUnlockTSLStart      = 50.0;    // Пик профита ноги для активации TSL
-input double             InpUnlockTSLStep       = 20.0;    // Откат от пика для закрытия ноги
-input bool               InpEnableRelock        = false;   // Переоткрывать частичный встречный лок при провале
-input double             InpRelockTriggerLoss   = 80.0;    // Убыток на оставшейся ноге для перелока (валюта депо)
-input double             InpRelockLotFactor     = 0.5;     // Доля объёма оставшейся ноги для перелока (0..1]
-input int                InpMaxRelocks          = 2;       // Максимум последовательных перелоков
+// ---------------------------------------------------------------------
+// AUXILIARY: HedgeLock (Mode 3)  — RECOVERI extension, no AW analogue
+// ---------------------------------------------------------------------
+input group "=== HedgeLock (Mode 3) ==="
+input double                 InpLockTriggerLoss   = 50.0;                // Mode3: убыток корзины для открытия лока (валюта депо)
+input double                 InpLockLotFactor     = 1.0;                 // Mode3: доля чистого объёма для лока (1.0 = 100%)
 
+// ---------------------------------------------------------------------
+// AUXILIARY: Auto-unwind FSM (Mode 3)  — RECOVERI extension
+// ---------------------------------------------------------------------
+input group "=== Auto-unwind лока (Mode 3) ==="
+input bool                   InpAutoUnlock        = false;               // Mode3: включить авто-распил после лока
+input double                 InpUnlockProfitUSD   = 30.0;                // Mode3: профит ОДНОЙ ноги для её закрытия (валюта депо)
+input bool                   InpUseSideTSL        = true;                // Mode3: трейлинг профита ноги при распиле
+input double                 InpUnlockTSLStart    = 50.0;                // Mode3: пик профита ноги для активации TSL
+input double                 InpUnlockTSLStep     = 20.0;                // Mode3: откат от пика для закрытия ноги
+input bool                   InpEnableRelock      = false;               // Mode3: переоткрывать частичный встречный лок при провале
+input double                 InpRelockTriggerLoss = 80.0;                // Mode3: убыток на оставшейся ноге для перелока (валюта депо)
+input double                 InpRelockLotFactor   = 0.5;                 // Mode3: доля объёма оставшейся ноги для перелока (0..1]
+input int                    InpMaxRelocks        = 2;                   // Mode3: максимум последовательных перелоков
 
-input group "=== Standby-режим (старт по триггеру) ==="
-input ENUM_START_TRIGGER InpStartTrigger     = START_INSTANT;        // Триггер запуска
-input double             InpStartThreshold   = 100.0;                // Порог: % просадки или сумма ($)
-input bool               InpAutoResetAfterDone = false;              // Автосброс триггера после восстановления
+// ---------------------------------------------------------------------
+// AUXILIARY: Averaging / Martingale (Modes 1/2)
+// ---------------------------------------------------------------------
+input group "=== Averaging / Martingale (Modes 1/2) ==="
+input double                 InpStartLot          = 0.01;                // Mode1/2: стартовый лот
+input double                 InpLotMultiplier     = 1.5;                 // Mode2: множитель лота (мартингейл)
+input double                 InpLotAdd            = 0.0;                 // Mode1: прибавка к лоту (0 = не использовать)
+input int                    InpStepPoints        = 300;                 // Mode1/2: базовый шаг сетки (пункты)
+input double                 InpStepMultiplier    = 1.2;                 // Mode1/2: множитель шага сетки
 
-input group "=== Partial Recovery (Mode 5) ==="
-input double             InpPartCloseLot     = 0.10;                 // Размер части убыточной позиции для закрытия (лот)
-input double             InpAvgVolume        = 0.15;                 // Объём первого усреднителя (≈ Part * 1.5)
-input double             InpAvgVolumeMul     = 1.0;                  // Множитель объёма усреднителей (>=1)
-input int                InpAvgStepPts       = 250;                  // Шаг сетки усреднителей (пункты)
-input double             InpAvgStepMul       = 1.2;                  // Множитель шага усреднителей
-input int                InpAvgTPpts         = 30;                   // TP усреднителя (пункты, должен > 3*spread)
-input int                InpMaxAveragers     = 15;                   // Макс. число одновременных усреднителей
-input bool               InpPRBidirectional  = false;                // Открывать усреднители в обе стороны
-input int                InpOverlapAfterN    = 0;                    // Closing overlap: 0=off, N=>после N оставлять только first+last
-input ENUM_RECOVERY_PRIORITY InpRecoveryPriority = PRIO_HARD;        // Приоритет: какие убыточные ордера обрабатывать первыми
-input ulong              InpFirstTicket      = 0;                    // Конкретный тикет первым (0=не использовать)
-input bool               InpEnsureNetPositive = true;                // Mode5: гарантировать неотрицательный итог пары (TP усреднителя + чип убыточника)
-input double             InpMinNetProfit      = 0.0;                 // Mode5: минимальный итог пары в валюте депо (>=0), абсолютный «пол»
-input double             InpMinNetProfitPct   = 0.0;                 // Mode5: минимальный итог пары в % от прибыли усреднителя (0..100). Эффективный пол = max(InpMinNetProfit, avgProfit*Pct/100)
-input bool               InpRestartGridOnTrendFlip = true;           // Mode5: при смене тренда сбрасывать счётчик усреднителей на новой стороне
-input bool               InpCloseOldGridOnTrendFlip = true;          // Mode5: при смене тренда закрывать старую сетку усреднителей по профиту корзинно
-input double             InpOldGridCloseProfit     = 0.0;            // Mode5: мин. суммарный профит старой сетки для её закрытия (валюта депо, >=0)
-input bool               InpTrendFlipTrimStrong    = false;          // Mode5: при смене тренда срезать лок до объёма противоположного оригинала (PR-AVG не трогаются)
-input bool               InpKeepOldGridAlive       = false;          // Mode5: при смене тренда не трогать старую сетку — пусть дозакроется по своим TP, новая стартует параллельно
-input bool               InpSeedNewGridLot         = false;          // Mode5: новая сетка после флипа стартует с лота последнего усреднителя старой стороны (множитель применяется поверх) до закрытия обеих сеток
-
-input group "=== Тренд-фильтр для усреднителей ==="
-input bool               InpUseTrendFilter   = false;                // Включить тренд-фильтр (MA cross на старшем ТФ)
-input ENUM_TIMEFRAMES    InpTrendTF          = PERIOD_H1;            // Таймфрейм для тренд-фильтра
-input int                InpTrendFastMA      = 21;                   // Период быстрой MA
-input int                InpTrendSlowMA      = 50;                   // Период медленной MA
-input bool               InpOneOrderPerBar   = false;                // Не более одного усреднителя на свечу
-
-input group "=== ATR-сетка усреднителей (Mode 5) ==="
-input bool               InpAvgStepUseATR    = false;                // Брать шаг сетки усреднителей из ATR выбранного ТФ
-input ENUM_TIMEFRAMES    InpAvgStepATRTF     = PERIOD_D1;            // ТФ для ATR (D1 по умолчанию)
-input int                InpAvgStepATRPeriod = 14;                   // Период ATR
-input double             InpAvgStepATRMul    = 0.5;                  // Множитель ATR (шаг = ATR/Point * Mul, в пунктах)
-input int                InpAvgStepATRMin    = 100;                  // Минимум шага в пунктах (пол при тонком рынке/нулевом ATR)
-
-input group "=== Выравнивание лока по ТФ (Mode 3/5) ==="
-input bool               InpLockAlignUseTF      = false;             // Выравнивать перевес BUY/SELL раз в бар выбранного ТФ
-input ENUM_TIMEFRAMES    InpLockAlignTF         = PERIOD_D1;         // ТФ выравнивания (D1 по умолчанию)
-input double             InpLockAlignThresholdLot = 0.0;              // Мин. перевес в лотах для срабатывания (0 = только > minLot)
-input bool               InpLockAlignOnlyProfit = true;              // Срезать только позиции в плюсе («положительная зона»)
-
-input group "=== Отключение чужих советников ==="
-input ENUM_DISABLE_EAS   InpDisableOtherEAs  = DISABLE_NONE;         // Снять других ботов при старте recovery
-
-input group "=== Защита счёта ==="
-input bool               InpUseEquityStop = false;               // Включить аварийный equity-стоп
-input double             InpEquityStopPct = 50.0;                // Порог equity (% от баланса)
-input bool               InpCloseOnly     = false;               // Только закрытие (новые сделки не открывать)
-
-input group "=== Фильтр времени ==="
-input bool               InpUseTimeFilter = false;               // Включить фильтр времени
-input int                InpStartHour     = 0;                   // Начало торгового окна (час 0..24)
-input int                InpEndHour       = 24;                  // Конец торгового окна (час 0..24)
-input bool               InpTradeMon      = true;                // Понедельник
-input bool               InpTradeTue      = true;                // Вторник
-input bool               InpTradeWed      = true;                // Среда
-input bool               InpTradeThu      = true;                // Четверг
-input bool               InpTradeFri      = true;                // Пятница
-input bool               InpTradeSat      = false;               // Суббота
-input bool               InpTradeSun      = false;               // Воскресенье
-
-input group "=== Новостной фильтр (MT5 Calendar) ==="
-input bool               InpUseNewsFilter = false;               // Включить новостной фильтр
-input bool               InpNewsHigh      = true;                // Блокировать события High
-input bool               InpNewsMedium    = false;               // Блокировать события Medium
-input bool               InpNewsLow       = false;               // Блокировать события Low
-input int                InpNewsMinsBefore= 30;                  // Минут до события
-input int                InpNewsMinsAfter = 30;                  // Минут после события
-
+// ---------------------------------------------------------------------
+// AUXILIARY: Notifications, persistence, panel, manual buttons, grid
+// ---------------------------------------------------------------------
 input group "=== Уведомления ==="
-input bool               InpUseAlert      = true;                // Всплывающий Alert()
-input bool               InpUseSound      = false;               // Звук
-input string             InpSoundFile     = "alert.wav";         // Звуковой файл
-input bool               InpUsePush       = false;               // Push на телефон (Settings -> Notifications)
-input bool               InpUseEmail      = false;               // Email (требует SMTP в Tools->Options->Email)
+input bool                   InpUseAlert          = true;                // Всплывающий Alert()
+input bool                   InpUseSound          = false;               // Звук
+input string                 InpSoundFile         = "alert.wav";         // Звуковой файл
+input bool                   InpUsePush           = false;               // Push на телефон (Settings -> Notifications)
+input bool                   InpUseEmail          = false;               // Email (требует SMTP в Tools->Options->Email)
 
 input group "=== Сохранение состояния ==="
-input bool               InpUsePersistence= true;                // Сохранять paused/BE/TSL/peaks через GlobalVariables
+input bool                   InpUsePersistence    = true;                // Сохранять paused/BE/TSL/peaks через GlobalVariables
 
 input group "=== Безусловная сетка (limit-ордера) ==="
-input bool               InpUseUncondGrid     = false;           // Включить безусловную сетку лимитников
-input ENUM_GRID_SIDE     InpGridSide          = GRID_BOTH;       // Сторона сетки
-input int                InpGridLevels        = 5;               // Количество уровней
-input int                InpGridStepPoints    = 200;             // Шаг между уровнями (пункты)
-input double             InpGridStartLot      = 0.01;            // Лот первого уровня
-input double             InpGridLotMultiplier = 1.0;             // Множитель лота (1.0 = одинаковый, >1 = мартингейл)
-input bool               InpGridReplaceFilled = false;           // Переоткрывать сработавшие уровни
+input bool                   InpUseUncondGrid     = false;               // Включить безусловную сетку лимитников
+input ENUM_GRID_SIDE         InpGridSide          = GRID_BOTH;           // Сторона сетки
+input int                    InpGridLevels        = 5;                   // Количество уровней
+input int                    InpGridStepPoints    = 200;                 // Шаг между уровнями (пункты)
+input double                 InpGridStartLot      = 0.01;                // Лот первого уровня
+input double                 InpGridLotMultiplier = 1.0;                 // Множитель лота (1.0 = одинаковый, >1 = мартингейл)
+input bool                   InpGridReplaceFilled = false;               // Переоткрывать сработавшие уровни
 
 input group "=== Ручная торговля (тестер/график) ==="
-input bool               InpShowManualButtons = true;            // Показывать кнопки ручного открытия BUY/SELL
-input double             InpManualLot         = 0.01;            // Лот для ручных кнопок BUY/SELL
+input bool                   InpShowManualButtons = true;                // Показывать кнопки ручного открытия BUY/SELL
+input double                 InpManualLot         = 0.01;                // Лот для ручных кнопок BUY/SELL
+input bool                   InpShowAvgNowButton  = true;                // v1.60: показывать кнопку "Avg Now" (Mode 5 only)
 
 input group "=== Панель ==="
-input bool               InpShowPanel     = true;                // Показывать панель на графике
-input color              InpPanelColor    = clrWhite;            // Цвет текста панели
-input int                InpPanelFontSize = 10;                  // Размер шрифта панели
+input bool                   InpShowPanel         = true;                // Показывать панель на графике
+input color                  InpPanelColor        = clrWhite;            // Цвет текста панели
+input int                    InpPanelFontSize     = 10;                  // Размер шрифта панели
 
 //=== Globals ========================================================
 CTrade         trade;
@@ -499,33 +414,22 @@ datetime      g_prLastBarTime = 0;         // for one-per-bar averagers (BUY sid
 datetime      g_prLastBarTimeS= 0;         // for one-per-bar averagers (SELL side)
 int           g_prAvgCountBuy = 0;
 int           g_prAvgCountSell= 0;
-int           g_prLastTrend   = 0;         // last seen trend direction (-1/0/+1) for flip detection
+int           g_prLastTrend   = 0;         // last seen trend direction (-1/0/+1), retained for log diagnostics
 
-// v1.44: close-old-grid-on-trend-flip state.  Set when trend flips while
-// PR_RECOVERING; on each tick we sum PnL of all PR-AVG-* on the marked
-// side and close the whole basket when it crosses InpOldGridCloseProfit.
-bool                g_prCloseOldActive = false;
-ENUM_POSITION_TYPE  g_prCloseOldSide   = POSITION_TYPE_BUY;
-
-// v1.53: seed-lot for the NEW-side grid after a trend flip.  When the
-// trend flips and InpSeedNewGridLot=true, we capture the lot of the
-// last PR-AVG-* averager on the OLD (abandoned) side and use it as the
-// BASE lot for the next opening on the NEW side instead of InpAvgVolume.
-// InpAvgVolumeMul still applies multiplicatively per step.  The seed
-// stays armed until BOTH grids (old and new) are fully gone — i.e. no
-// PR-AVG-* positions remain on chart — at which point AnyAveragerOpen()
-// returns false and the seed auto-disarms back to InpAvgVolume.
-bool                g_prSeedActive = false;
-ENUM_POSITION_TYPE  g_prSeedSide   = POSITION_TYPE_BUY;  // side that uses the seed lot (NEW side)
-double              g_prSeedLot    = 0.0;
-
-// v1.52: gate for the TF-driven lock alignment routine.  Tracks the
-// last bar time of InpLockAlignTF on which AlignLockByTF() ran, so the
-// routine fires once per bar and not on every tick.
-datetime            g_alignLastBarTime = 0;
+// v1.60: initial drawdown captured the first tick after the start trigger
+// fires AND bs.profit < 0.  Used by the "Recovery: NN%" panel readout to
+// show how much of the original loss has been recovered.  Cleared on
+// PR_IDLE re-entry / mode change / Reset State.  Persisted in GV RC_DD0.
+double              g_initialDrawdown = 0.0;
 
 // GlobalVariables key prefix (instance-scoped: symbol + magic)
 string  g_gvPrefix       = "";
+
+// v1.60: TP-zone line object names (one per side for PER_SIDE basket,
+// one for COMBINED).  Recreated each tick by UpdateTPLine().
+#define TPLINE_COMBINED  "RECOVERI_TPLINE_C"
+#define TPLINE_BUY       "RECOVERI_TPLINE_B"
+#define TPLINE_SELL      "RECOVERI_TPLINE_S"
 
 #define BTN_CLOSE_ALL    "RECOVERI_BTN_CLOSE_ALL"
 #define BTN_CLOSE_BUY    "RECOVERI_BTN_CLOSE_BUY"
@@ -536,6 +440,7 @@ string  g_gvPrefix       = "";
 #define BTN_RESET_STATE  "RECOVERI_BTN_RESET_STATE"
 #define BTN_MANUAL_BUY   "RECOVERI_BTN_MANUAL_BUY"
 #define BTN_MANUAL_SELL  "RECOVERI_BTN_MANUAL_SELL"
+#define BTN_AVG_NOW      "RECOVERI_BTN_AVG_NOW"
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -567,8 +472,6 @@ int OnInit()
         { Print("Trend filter MA periods invalid (need 0<fast<slow)"); return INIT_PARAMETERS_INCORRECT; }
       if(InpMinNetProfit < 0)
         { Print("InpMinNetProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
-      if(InpOldGridCloseProfit < 0)
-        { Print("InpOldGridCloseProfit must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
       // v1.52 ATR-grid sanity
       if(InpAvgStepUseATR)
         {
@@ -579,15 +482,23 @@ int OnInit()
          if(InpAvgStepATRMin <= 0)
            { Print("InpAvgStepATRMin must be > 0 (floor in points)"); return INIT_PARAMETERS_INCORRECT; }
         }
-     }
-
-   // v1.52: TF-based lock alignment is available in Mode 3 (HedgeLock) and
-   // Mode 5 (PartialRecovery). Sanity-check inputs here regardless of
-   // the active mode so misconfig fails fast.
-   if(InpLockAlignUseTF && InpLockAlignThresholdLot < 0)
-     {
-      Print("InpLockAlignThresholdLot must be >= 0");
-      return INIT_PARAMETERS_INCORRECT;
+      // v1.60 Slow Start sanity
+      if(InpUseSlowStart)
+        {
+         if(InpSlowStartLossSteps <= 0)
+           { Print("InpSlowStartLossSteps must be > 0 when InpUseSlowStart=true"); return INIT_PARAMETERS_INCORRECT; }
+         if(InpSlowStartLossStepUSD <= 0)
+           { Print("InpSlowStartLossStepUSD must be > 0 when InpUseSlowStart=true"); return INIT_PARAMETERS_INCORRECT; }
+        }
+      // v1.60 dynamic-lot sanity
+      if(InpAvgLotPctOfLosing < 0 || InpAvgLotPctOfLosing > 1000)
+        { Print("InpAvgLotPctOfLosing must be in [0, 1000]"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAvgLotPerLossUSD < 0)
+        { Print("InpAvgLotPerLossUSD must be >= 0"); return INIT_PARAMETERS_INCORRECT; }
+      if(InpAvgLotMode == AVG_LOT_PCT_OF_LOSING && InpAvgLotPctOfLosing <= 0)
+        Print("WARNING: InpAvgLotMode=PCT_OF_LOSING but InpAvgLotPctOfLosing=0; lot will fall back to broker minLot.");
+      if(InpAvgLotMode == AVG_LOT_FROM_LOSS_USD && InpAvgLotPerLossUSD <= 0)
+        Print("WARNING: InpAvgLotMode=FROM_LOSS_USD but InpAvgLotPerLossUSD=0; lot will fall back to broker minLot.");
      }
 
    if(InpMode == MODE_HEDGE_LOCK)
@@ -653,9 +564,10 @@ int OnInit()
                InpUsePersistence ? "on" : "off", lsName, (int)InpMode, InpMagic);
    if(InpShowPanel) CreatePanel();
    if(InpUseUncondGrid && !g_gridPlaced) PlaceUnconditionalGrid();  // sets g_gridPlaced internally
-   PrintFormat("RECOVERI v1.52 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f Magic=%I64d",
+   PrintFormat("RECOVERI v1.60 Mode=%d Manage=%d SymScope=%d Basket=%d AutoUnlock=%d Trigger=%d Thr=%.2f SlowStart=%d LotMode=%d Magic=%I64d",
                (int)InpMode,(int)InpManageScope,(int)InpSymbolScope,(int)InpBasketMode,
-               (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold, InpMagic);
+               (int)InpAutoUnlock, (int)InpStartTrigger, InpStartThreshold,
+               (int)InpUseSlowStart, (int)InpAvgLotMode, InpMagic);
    return INIT_SUCCEEDED;
   }
 
@@ -755,6 +667,7 @@ void HandlePanelClick(const string sparam)
    else if(sparam == BTN_RESET_STATE){ Print("BTN: Reset State");  DoResetState(); }
    else if(sparam == BTN_MANUAL_BUY) { Print("BTN: Manual BUY");   DoManualOpen(ORDER_TYPE_BUY); }
    else if(sparam == BTN_MANUAL_SELL){ Print("BTN: Manual SELL");  DoManualOpen(ORDER_TYPE_SELL); }
+   else if(sparam == BTN_AVG_NOW)    { Print("BTN: Avg Now");      DoManualAvgNow(); }
    else return;
 
    ObjectSetInteger(0, sparam, OBJPROP_STATE, false);
@@ -779,7 +692,7 @@ void PollPanelButtons()
      {
       BTN_CLOSE_ALL, BTN_CLOSE_BUY, BTN_CLOSE_SELL,
       BTN_PAUSE, BTN_LOCK, BTN_RESET, BTN_RESET_STATE,
-      BTN_MANUAL_BUY, BTN_MANUAL_SELL
+      BTN_MANUAL_BUY, BTN_MANUAL_SELL, BTN_AVG_NOW
      };
    for(int i=0; i<ArraySize(buttons); i++)
      {
@@ -1272,10 +1185,6 @@ void DoHedgeLock(const BasketState &bs)
    if(InpSymbolScope != SCOPE_CURRENT) return;
    if(!SpreadOK(_Symbol)) return;
 
-   // v1.52: TF-driven imbalance trim ("выравнивание лока по ТФ").
-   // Self-gated by InpLockAlignUseTF and once-per-bar of InpLockAlignTF.
-   AlignLockByTF();
-
    // If auto-unwind is enabled, run the state machine instead of plain lock
    if(InpAutoUnlock) { DoLockUnwind(bs); return; }
 
@@ -1634,19 +1543,6 @@ bool IsNewBar(datetime &lastBar)
   }
 
 //+------------------------------------------------------------------+
-//| v1.52: same as IsNewBar but parameterised by an explicit TF.      |
-//| Used by AlignLockByTF() to throttle the routine to once-per-bar  |
-//| of InpLockAlignTF (e.g. once per D1 bar by default).             |
-//+------------------------------------------------------------------+
-bool IsNewBarTF(const ENUM_TIMEFRAMES tf, datetime &lastBar)
-  {
-   datetime cur = iTime(_Symbol, tf, 0);
-   if(cur == 0) return false;
-   if(cur != lastBar) { lastBar = cur; return true; }
-   return false;
-  }
-
-//+------------------------------------------------------------------+
 //| v1.52: averager grid step in POINTS for a given chain index.      |
 //|                                                                   |
 //| Two modes:                                                        |
@@ -1682,171 +1578,6 @@ double AvgStepPoints(const int chainIdx)
       basePts = (atrPts >= minPts) ? atrPts : minPts;
      }
    return basePts * MathPow(InpAvgStepMul, MathMax(0, chainIdx));
-  }
-
-//+------------------------------------------------------------------+
-//| v1.52: TF-driven lock alignment ("выравнивание лока по ТФ").     |
-//|                                                                   |
-//| Once per new bar of InpLockAlignTF (D1 by default), measure the  |
-//| imbalance between BUY and SELL across ALL managed positions      |
-//| (PR-LOCK, PR-AVG, originals, AVG-*, GRID-*, manual-lock, etc.).  |
-//| If the heavier side exceeds the lighter side by more than        |
-//| max(InpLockAlignThresholdLot, minLot), trim the heavier side     |
-//| down to the lighter — preferring positions that are CURRENTLY    |
-//| in profit (the "positive zone"), so the realized PnL footprint  |
-//| of the trim is positive.                                         |
-//|                                                                   |
-//| InpLockAlignOnlyProfit:                                            |
-//|   true  (default) — only PnL>0 candidates are touched.  If none  |
-//|                     exist on the heavier side this tick, log and  |
-//|                     skip; balance will be re-checked next bar.   |
-//|   false           — fall back to all positions sorted DESC by    |
-//|                     PnL (most profitable / least loss first).    |
-//|                                                                   |
-//| The last position closed may be partially closed via              |
-//| ClosePartOfPosition() to land exactly on the matching volume.    |
-//| PR-AVG counters are recomputed from a scan after a successful    |
-//| pass to keep the next averager open with correct multiplier.    |
-//+------------------------------------------------------------------+
-void AlignLockByTF()
-  {
-   if(!InpLockAlignUseTF) return;
-   if(!IsNewBarTF(InpLockAlignTF, g_alignLastBarTime)) return;
-
-   // Sum managed volumes BUY/SELL across the whole basket.
-   double buyVol = 0.0, sellVol = 0.0;
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;                       // also selects pos
-      double v = pos.Volume();
-      if(pos.PositionType() == POSITION_TYPE_BUY)       buyVol  += v;
-      else if(pos.PositionType() == POSITION_TYPE_SELL) sellVol += v;
-     }
-
-   double minLot   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-   double diff     = MathAbs(buyVol - sellVol);
-   double threshold = MathMax(InpLockAlignThresholdLot, minLot);
-   if(diff < threshold) return;  // already balanced enough
-
-   ENUM_POSITION_TYPE heavy = (buyVol > sellVol) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-
-   // Collect candidates on the heavier side.
-   ulong  tickets[];
-   double profits[];
-   double vols[];
-   int    skippedNonProfit = 0;
-   for(int i = 0; i < total; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;
-      if(pos.PositionType() != heavy) continue;
-      double pft = pos.Profit() + pos.Swap() + pos.Commission();
-      if(InpLockAlignOnlyProfit && pft <= 0) { skippedNonProfit++; continue; }
-      int n = ArraySize(tickets);
-      ArrayResize(tickets, n + 1);
-      ArrayResize(profits, n + 1);
-      ArrayResize(vols,    n + 1);
-      tickets[n] = t;
-      profits[n] = pft;
-      vols[n]    = pos.Volume();
-     }
-
-   int N = ArraySize(tickets);
-   if(N == 0)
-     {
-      PrintFormat("AlignByTF[%s]: imbalance %.4f lot on %s, no candidates%s "
-                  "(skippedNonProfit=%d) — will retry next bar",
-                  EnumToString(InpLockAlignTF), diff,
-                  heavy == POSITION_TYPE_BUY ? "BUY" : "SELL",
-                  InpLockAlignOnlyProfit ? " in profit" : "",
-                  skippedNonProfit);
-      return;
-     }
-
-   // Sort DESC by PnL (lock the most profitable first / least loss first).
-   for(int a = 0; a < N - 1; a++)
-      for(int b = a + 1; b < N; b++)
-         if(profits[b] > profits[a])
-           {
-            double tp = profits[a]; profits[a] = profits[b]; profits[b] = tp;
-            ulong  tt = tickets[a]; tickets[a] = tickets[b]; tickets[b] = tt;
-            double tv = vols[a];    vols[a]    = vols[b];    vols[b]    = tv;
-           }
-
-   double remaining   = diff;
-   int    closedFull  = 0;
-   int    closedPart  = 0;
-   double closedTotal = 0.0;
-   double realizedPnl = 0.0;
-
-   for(int i = 0; i < N && remaining >= minLot; i++)
-     {
-      if(!pos.SelectByTicket(tickets[i])) continue;
-      double posVol = pos.Volume();
-
-      if(posVol <= remaining + 1e-9)
-        {
-         if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
-           {
-            closedFull++;
-            closedTotal += posVol;
-            realizedPnl += profits[i];
-            remaining   -= posVol;
-           }
-         else
-           {
-            PrintFormat("AlignByTF: PositionClose #%I64u failed err=%d ret=%d",
-                        tickets[i], GetLastError(), trade.ResultRetcode());
-           }
-        }
-      else
-        {
-         if(ClosePartOfPosition(tickets[i], remaining))
-           {
-            closedPart++;
-            closedTotal += remaining;
-            // realizedPnl approx: pro-rate by volume share
-            if(posVol > 0) realizedPnl += profits[i] * (remaining / posVol);
-            remaining = 0.0;
-           }
-         else
-           {
-            PrintFormat("AlignByTF: ClosePartOfPosition #%I64u %.4f failed",
-                        tickets[i], remaining);
-           }
-        }
-     }
-
-   if(closedFull == 0 && closedPart == 0) return;
-
-   // PR-AVG counters may have shifted if a PR-AVG position was on the
-   // heavy side — rescan.
-   int avgB = 0, avgS = 0;
-   int t2 = PositionsTotal();
-   for(int i = 0; i < t2; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;
-      string cmt = pos.Comment();
-      if(StringFind(cmt, "PR-AVG-B") >= 0)      avgB++;
-      else if(StringFind(cmt, "PR-AVG-S") >= 0) avgS++;
-     }
-   g_prAvgCountBuy  = avgB;
-   g_prAvgCountSell = avgS;
-
-   PrintFormat("AlignByTF[%s]: trimmed %s -%.4f lot (%d full, %d partial), "
-               "imbalance was %.4f, locked PnL ~%.2f %s",
-               EnumToString(InpLockAlignTF),
-               heavy == POSITION_TYPE_BUY ? "BUY" : "SELL",
-               closedTotal, closedFull, closedPart, diff, realizedPnl,
-               AccountInfoString(ACCOUNT_CURRENCY));
-   Notify(StringFormat("AlignByTF: %s -%.4f lot (locked ~%.2f)",
-                       heavy == POSITION_TYPE_BUY ? "BUY" : "SELL",
-                       closedTotal, realizedPnl));
-
-   if(InpUsePersistence) SaveState();
   }
 
 //+------------------------------------------------------------------+
@@ -1968,17 +1699,70 @@ void ApplyClosingOverlap(const ENUM_POSITION_TYPE side, const string avgTag)
   }
 
 //+------------------------------------------------------------------+
-//| MODE_PARTIAL_RECOVERY: lock + grid averagers + partial closing   |
+//+------------------------------------------------------------------+
+//| v1.60: compute the lot for the next PR-AVG-{B|S} averager, given |
+//| the chain index on that side, the absolute losing-side volume    |
+//| (sum of |PnL<0| originals + PR-LOCK on opposite side, used by    |
+//| PCT_OF_LOSING) and the current floating loss in deposit currency |
+//| (used by FROM_LOSS_USD).  Returns NormalizeLot()-clamped value.  |
 //|                                                                  |
-//| Strategy (a la AW Recovery, simplified & open-source):           |
+//| Sizing strategies (InpAvgLotMode):                                |
+//|   FIXED          : InpAvgVolume * InpAvgVolumeMul^chainIdx        |
+//|                    (legacy v1.53 default; chain multiplier ON)   |
+//|   PCT_OF_LOSING  : losingSideVolume * InpAvgLotPctOfLosing/100    |
+//|                    (chain multiplier OFF: lot already scales w/  |
+//|                     loser size)                                   |
+//|   FROM_LOSS_USD  : floatingLoss * InpAvgLotPerLossUSD             |
+//|                    (chain multiplier OFF: lot already scales w/  |
+//|                     loss depth)                                   |
+//|   MAX_OF_ALL     : max(FIXED, PCT, FROM_LOSS_USD)                 |
+//|                    (chain multiplier APPLIED via FIXED)          |
+//+------------------------------------------------------------------+
+double ComputeAvgLot(const int chainIdx,
+                     const double losingSideVolume,
+                     const double floatingLossUSD)
+  {
+   double fixedLot = InpAvgVolume * MathPow(InpAvgVolumeMul, MathMax(0, chainIdx));
+   double pctLot   = (InpAvgLotPctOfLosing > 0)
+                     ? losingSideVolume * InpAvgLotPctOfLosing / 100.0 : 0.0;
+   double lossLot  = (InpAvgLotPerLossUSD > 0)
+                     ? floatingLossUSD * InpAvgLotPerLossUSD : 0.0;
+   double lot = 0.0;
+   switch(InpAvgLotMode)
+     {
+      case AVG_LOT_FIXED:         lot = fixedLot;                                   break;
+      case AVG_LOT_PCT_OF_LOSING: lot = pctLot;                                     break;
+      case AVG_LOT_FROM_LOSS_USD: lot = lossLot;                                    break;
+      case AVG_LOT_MAX_OF_ALL:    lot = MathMax(fixedLot, MathMax(pctLot, lossLot)); break;
+      default:                    lot = fixedLot;                                   break;
+     }
+   return NormalizeLot(_Symbol, lot);
+  }
+
+//+------------------------------------------------------------------+
+//| MODE_PARTIAL_RECOVERY — v1.60 rewrite for AW Recovery alignment. |
+//|                                                                  |
+//| Flow (a la AW Recovery, with RECOVERI's net-positive guard):     |
 //|   1) PR_IDLE     - wait for trigger (handled by IsRecoveryTriggered)
-//|   2) PR_LOCKING  - balance volumes BUY/SELL into a lock          |
-//|   3) PR_RECOVERING -                                             |
-//|        - open averagers (grid step + multiplier)                 |
-//|        - on each averager that hits +TP_pts, close it AND        |
-//|          chip InpPartCloseLot from the worst losing position     |
-//|        - optional trend filter, one-per-bar, closing overlap     |
+//|   2) PR_LOCKING  - balance volumes BUY/SELL into a single lock    |
+//|   3) PR_RECOVERING -                                              |
+//|        - chip losing originals via profitable averagers          |
+//|          (ProcessProfitableAveragers, with InpEnsureNetPositive) |
+//|        - apply closing-overlap on long chains (InpOverlapAfterN) |
+//|        - open new averagers on the side aligned with trend       |
+//|          (or both sides if InpPRBidirectional), gated by step,   |
+//|          one-per-bar, MaxAveragers, and the v1.60 Slow Start     |
+//|          loss-bucket gate                                        |
+//|        - lot sized via ComputeAvgLot (FIXED/PCT/FROM_LOSS_USD/   |
+//|          MAX_OF_ALL)                                              |
 //|   4) PR_DONE     - all losing positions closed; reset state      |
+//|                                                                  |
+//| v1.60 vs v1.53: the entire trend-flip block (restart counters /  |
+//| close-old-grid-by-profit / trim-lock / keep-old-alive / seed-    |
+//| new-grid-lot) is GONE.  The trend filter still blocks new avgers |
+//| on the wrong side; the existing chain dies through its own       |
+//| InpAvgTPpts and the chip pairing — same as AW Recovery itself.   |
+//| TF lock-align routine is also gone.                              |
 //+------------------------------------------------------------------+
 void DoPartialRecovery(const BasketState &bs)
   {
@@ -1994,11 +1778,23 @@ void DoPartialRecovery(const BasketState &bs)
          Notify("Partial recovery complete");
          g_prPhase = PR_IDLE;
          g_prAvgCountBuy = 0; g_prAvgCountSell = 0;
-         g_prCloseOldActive = false;     // v1.44: nothing left to flush
+         // v1.60: reset Recovery% baseline so the next cycle captures fresh
+         g_initialDrawdown = 0.0;
          if(InpAutoResetAfterDone) g_recoveryTriggered = false;
          if(InpUsePersistence) SaveState();
         }
       return;
+     }
+
+   //--- v1.60: capture initial drawdown for Recovery% panel readout -----
+   // First tick after the start trigger has fired AND we are actually in
+   // a loss.  Stays put until PR_IDLE is re-entered.
+   if(g_recoveryTriggered && g_initialDrawdown <= 0 && bs.profit < 0)
+     {
+      g_initialDrawdown = -bs.profit;
+      PrintFormat("PR: initial drawdown captured = %.2f %s",
+                  g_initialDrawdown, AccountInfoString(ACCOUNT_CURRENCY));
+      if(InpUsePersistence) SaveState();
      }
 
    //--- detect entry ----------------------------------------------------
@@ -2039,26 +1835,6 @@ void DoPartialRecovery(const BasketState &bs)
    //--- PR_RECOVERING ---------------------------------------------------
    if(g_prPhase != PR_RECOVERING) return;
 
-   //--- v1.52: TF-driven imbalance trim ("выравнивание лока по ТФ") -----
-   // Runs at most once per bar of InpLockAlignTF (D1 by default).
-   // Independent from the trend-flip trim; complements it by handling
-   // slow imbalance drift while no trend flip occurs.
-   AlignLockByTF();
-
-   //--- v1.53: seed-lot auto-disarm -------------------------------------
-   // The seed (used to start the new-side grid with the lot of the last
-   // OLD-side averager) must stay armed until BOTH grids are gone.  Once
-   // there are no PR-AVG-* positions left on chart, drop back to the
-   // default base lot (InpAvgVolume).
-   if(g_prSeedActive && !AnyAveragerOpen())
-     {
-      PrintFormat("PR: seed-lot disarmed (all PR-AVG closed, base lot returns to InpAvgVolume=%.2f)",
-                  InpAvgVolume);
-      g_prSeedActive = false;
-      g_prSeedLot    = 0.0;
-      if(InpUsePersistence) SaveState();
-     }
-
    //--- Sanity: any losing original positions left?  If not -> close all.
    if(!HasLosingOriginalPositions())
      {
@@ -2088,121 +1864,12 @@ void DoPartialRecovery(const BasketState &bs)
    if(pt <= 0) return;
 
    int trend = TrendDirection();  // +1 / -1 / 0(filter off or neutral)
-
-   //--- Trend reversal handling (v1.43+v1.44+v1.53) ---------------------
-   // We detect a flip once and then conditionally apply behaviors:
-   //   * v1.43 "restart grid"          - reset counters/bar-gate on the
-   //                                     NEW side so a fresh chain can
-   //                                     grow immediately;
-   //   * v1.44 "close old grid"        - arm the OLD-side PR-AVG basket
-   //                                     for a profit-close
-   //                                     (TryCloseOldGridByProfit flushes
-   //                                     it once combined PnL crosses
-   //                                     InpOldGridCloseProfit);
-   //   * v1.51 "trim strong (lock)"    - one-shot lock trim to match the
-   //                                     opposite original volume;
-   //   * v1.53 "keep old grid alive"   - block the close-old flush and
-   //                                     the lock trim entirely; let the
-   //                                     old grid wind down naturally on
-   //                                     its own per-averager TPs;
-   //   * v1.53 "seed new grid lot"     - capture the lot of the last
-   //                                     OLD-side averager and use it as
-   //                                     the BASE lot for the new side
-   //                                     until both grids are gone.
-   // All behaviors can be enabled together; defaults keep prior v1.52
-   // behavior byte-for-byte (KeepOldGridAlive=false, SeedNewGridLot=false).
-   bool trendFlipped = (trend != 0 && g_prLastTrend != 0 && trend != g_prLastTrend);
-   if(trendFlipped)
-     {
-      PrintFormat("PR: trend flip %d -> %d", g_prLastTrend, trend);
-
-      // v1.53: capture seed-lot from the side we are abandoning BEFORE
-      // any close-old / trim could remove the averagers we read from.
-      if(InpSeedNewGridLot)
-        {
-         ENUM_POSITION_TYPE oldSide = (g_prLastTrend > 0) ? POSITION_TYPE_BUY  : POSITION_TYPE_SELL;
-         string             oldTag  = (oldSide == POSITION_TYPE_BUY) ? "PR-AVG-B" : "PR-AVG-S";
-         double seedLot = LastAveragerLot(oldSide, oldTag);
-         if(seedLot > 0)
-           {
-            g_prSeedActive = true;
-            g_prSeedLot    = seedLot;
-            g_prSeedSide   = (trend > 0) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;  // NEW side
-            PrintFormat("PR: seed new %s grid with base lot=%.2f (last %s averager)",
-                        g_prSeedSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
-                        seedLot, oldTag);
-            Notify(StringFormat("PR: new %s grid seeded with %.2f lot",
-                                g_prSeedSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
-                                seedLot));
-           }
-         else
-           {
-            PrintFormat("PR: seed-new-grid requested but no %s averagers found on old side -> seed skipped",
-                        oldTag);
-           }
-        }
-
-      if(InpRestartGridOnTrendFlip)
-        {
-         Notify(StringFormat("PR: trend reversal -> restart grid (%s)",
-                             trend > 0 ? "BUY" : "SELL"));
-         if(trend > 0)
-           { g_prAvgCountBuy  = 0; g_prLastBarTime  = 0; }
-         else
-           { g_prAvgCountSell = 0; g_prLastBarTimeS = 0; }
-        }
-
-      // v1.53: keep-old-grid-alive blocks BOTH the close-old flush and
-      // the lock trim.  The old side simply continues to live and close
-      // through its own per-averager TPs (InpAvgTPpts) + the chip-loser
-      // pairing in ProcessProfitableAveragers(), exactly as before the
-      // flip.  The new side runs in parallel under the new trend.
-      if(InpKeepOldGridAlive)
-        {
-         PrintFormat("PR: keep-old-grid-alive=true -> not arming close-old, not trimming lock; old %s grid closes on its own TPs",
-                     g_prLastTrend > 0 ? "BUY" : "SELL");
-         Notify(StringFormat("PR: keep old %s grid alive (closes on own TPs)",
-                             g_prLastTrend > 0 ? "BUY" : "SELL"));
-        }
-      else
-        {
-         if(InpCloseOldGridOnTrendFlip)
-           {
-            // Old side = the side that was being grown under the previous
-            // trend.  Re-arming on every flip is fine: even if a previous
-            // close-old was still pending, the new "old side" is now the
-            // direction price just abandoned.
-            g_prCloseOldActive = true;
-            g_prCloseOldSide   = (g_prLastTrend > 0) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
-            PrintFormat("PR: arm close-old-grid on %s side (target>=%.2f USD)",
-                        (g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-                        InpOldGridCloseProfit);
-            Notify(StringFormat("PR: arm close-old-grid on %s by profit",
-                                g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"));
-           }
-
-         // v1.51: одноразовый trim ИМЕННО ЛОКА на смене тренда.
-         // Считает lockVol на одной стороне и origVol (managed-позиции
-         // без тегов PR-AVG/PR-LOCK) на противоположной, режет лок до
-         // объёма противоположного оригинала. Усреднители (PR-AVG-*)
-         // и однонаправленные с локом оригиналы НЕ учитываются и НЕ
-         // закрываются — для них работают InpRestartGridOnTrendFlip и
-         // InpCloseOldGridOnTrendFlip.
-         if(InpTrendFlipTrimStrong)
-            TrimStrongSideToWeak();
-        }
-
-      if(InpUsePersistence) SaveState();
-     }
+   if(trend != 0 && g_prLastTrend != 0 && trend != g_prLastTrend)
+      PrintFormat("PR: trend flip %d -> %d (filter will block opposite-side averagers)",
+                  g_prLastTrend, trend);
    if(trend != 0) g_prLastTrend = trend;
 
-   // Try to flush the armed old-side grid every tick.  The helper closes
-   // and disarms itself once combined PnL >= InpOldGridCloseProfit, or
-   // disarms silently if no PR-AVG-* on the marked side remain.
-   if(g_prCloseOldActive)
-      TryCloseOldGridByProfit();
-
-   // BUY averager (covers SELL losing baskets if non-bidirectional)
+   //--- v1.60: choose direction(s) for new averagers --------------------
    bool wantBuy  = false;
    bool wantSell = false;
    if(InpPRBidirectional)
@@ -2217,15 +1884,51 @@ void DoPartialRecovery(const BasketState &bs)
       else                              wantSell = true;
      }
 
-   // Apply trend filter
+   //--- Trend filter: block new averagers against the trend -------------
    if(InpUseTrendFilter && trend != 0)
      {
-      if(trend < 0) wantBuy  = false;
-      if(trend > 0) wantSell = false;
+      if(trend < 0) wantBuy  = false;  // downtrend -> no new BUY
+      if(trend > 0) wantSell = false;  // uptrend   -> no new SELL
      }
 
-   // BUY averager
-   if(wantBuy && g_prAvgCountBuy < InpMaxAveragers)
+   //--- v1.60: Slow Start gate ------------------------------------------
+   // Bucket index grows with current floating loss.  Each side's chain
+   // length cannot exceed the bucket index.  At bucket 0 (no loss yet),
+   // no PR-AVG opens at all.  Replaces AW's "slow launch in case of
+   // drawdown".  Off by default — when InpUseSlowStart=false the cap is
+   // simply InpMaxAveragers (legacy behaviour).
+   int slowCap = InpMaxAveragers;
+   if(InpUseSlowStart && InpSlowStartLossStepUSD > 0 && InpSlowStartLossSteps > 0)
+     {
+      double curLoss = (bs.profit < 0) ? -bs.profit : 0.0;
+      int bucket = (int)MathFloor(curLoss / InpSlowStartLossStepUSD);
+      if(bucket < 0)                       bucket = 0;
+      if(bucket > InpSlowStartLossSteps)   bucket = InpSlowStartLossSteps;
+      slowCap = MathMin(InpMaxAveragers, bucket);
+     }
+
+   //--- v1.60: pre-compute losing-side volume + floating loss for       |
+   //--- ComputeAvgLot (PCT_OF_LOSING / FROM_LOSS_USD modes) -------------
+   double losingVolForBuyAvg  = 0.0;  // SELL losers volume — what BUY avg covers
+   double losingVolForSellAvg = 0.0;  // BUY  losers volume — what SELL avg covers
+   {
+      int total = PositionsTotal();
+      for(int i = 0; i < total; i++)
+        {
+         ulong t = PositionGetTicket(i);
+         if(!IsManaged(t)) continue;
+         string cmt = pos.Comment();
+         if(StringFind(cmt, "PR-AVG") >= 0) continue;
+         double pft = pos.Profit() + pos.Swap() + pos.Commission();
+         if(pft >= 0) continue;  // only losers contribute
+         if(pos.PositionType() == POSITION_TYPE_SELL) losingVolForBuyAvg  += pos.Volume();
+         else if(pos.PositionType() == POSITION_TYPE_BUY)  losingVolForSellAvg += pos.Volume();
+        }
+   }
+   double floatingLossUSD = (bs.profit < 0) ? -bs.profit : 0.0;
+
+   //--- BUY averager ----------------------------------------------------
+   if(wantBuy && g_prAvgCountBuy < slowCap)
      {
       double lastB = LastAveragerPrice(POSITION_TYPE_BUY, "PR-AVG-B");
       double step  = AvgStepPoints(g_prAvgCountBuy) * pt;
@@ -2233,11 +1936,7 @@ void DoPartialRecovery(const BasketState &bs)
       bool barOK   = !InpOneOrderPerBar || IsNewBar(g_prLastBarTime);
       if(spaceOK && barOK)
         {
-         // v1.53: if seeded for BUY side, use last-old-averager lot as base.
-         double base = (g_prSeedActive && g_prSeedSide == POSITION_TYPE_BUY)
-                       ? g_prSeedLot : InpAvgVolume;
-         double lot = base * MathPow(InpAvgVolumeMul, MathMax(0, g_prAvgCountBuy));
-         lot = NormalizeLot(_Symbol, lot);
+         double lot = ComputeAvgLot(g_prAvgCountBuy, losingVolForBuyAvg, floatingLossUSD);
          if(lot > 0 && OpenPosition(_Symbol, ORDER_TYPE_BUY, lot, "PR-AVG-B"))
            {
             g_prAvgCountBuy++;
@@ -2245,8 +1944,8 @@ void DoPartialRecovery(const BasketState &bs)
            }
         }
      }
-   // SELL averager
-   if(wantSell && g_prAvgCountSell < InpMaxAveragers)
+   //--- SELL averager ---------------------------------------------------
+   if(wantSell && g_prAvgCountSell < slowCap)
      {
       double lastS = LastAveragerPrice(POSITION_TYPE_SELL, "PR-AVG-S");
       double step  = AvgStepPoints(g_prAvgCountSell) * pt;
@@ -2254,11 +1953,7 @@ void DoPartialRecovery(const BasketState &bs)
       bool barOK   = !InpOneOrderPerBar || IsNewBar(g_prLastBarTimeS);
       if(spaceOK && barOK)
         {
-         // v1.53: if seeded for SELL side, use last-old-averager lot as base.
-         double base = (g_prSeedActive && g_prSeedSide == POSITION_TYPE_SELL)
-                       ? g_prSeedLot : InpAvgVolume;
-         double lot = base * MathPow(InpAvgVolumeMul, MathMax(0, g_prAvgCountSell));
-         lot = NormalizeLot(_Symbol, lot);
+         double lot = ComputeAvgLot(g_prAvgCountSell, losingVolForSellAvg, floatingLossUSD);
          if(lot > 0 && OpenPosition(_Symbol, ORDER_TYPE_SELL, lot, "PR-AVG-S"))
            {
             g_prAvgCountSell++;
@@ -2287,346 +1982,6 @@ double LastAveragerPrice(const ENUM_POSITION_TYPE side, const string tag)
         { bestTime = tm; bestPrice = pos.PriceOpen(); }
      }
    return bestPrice;
-  }
-
-//+------------------------------------------------------------------+
-//| v1.53: find the latest opening LOT for an averager of given      |
-//| side+tag.  Used to seed the new-side grid after a trend flip so  |
-//| the new chain doesn't restart from InpAvgVolume but continues    |
-//| from the lot the old side reached just before the flip.          |
-//+------------------------------------------------------------------+
-double LastAveragerLot(const ENUM_POSITION_TYPE side, const string tag)
-  {
-   double   bestLot  = 0.0;
-   datetime bestTime = 0;
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;
-      if(pos.PositionType() != side) continue;
-      if(StringFind(pos.Comment(), tag) < 0) continue;
-      datetime tm = (datetime)pos.Time();
-      if(tm > bestTime)
-        { bestTime = tm; bestLot = pos.Volume(); }
-     }
-   return bestLot;
-  }
-
-//+------------------------------------------------------------------+
-//| v1.53: any PR-AVG-B / PR-AVG-S managed position open on chart?   |
-//| Used to auto-disarm the seed-lot machinery once BOTH grids       |
-//| (old + new) have fully closed.                                   |
-//+------------------------------------------------------------------+
-bool AnyAveragerOpen()
-  {
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;
-      string cmt = pos.Comment();
-      if(StringFind(cmt, "PR-AVG-B") >= 0) return true;
-      if(StringFind(cmt, "PR-AVG-S") >= 0) return true;
-     }
-   return false;
-  }
-
-//+------------------------------------------------------------------+
-//| v1.44: close-old-grid-by-profit.                                  |
-//|                                                                   |
-//| When trend flips while PR_RECOVERING, DoPartialRecovery arms      |
-//| g_prCloseOldActive=true and tags the OLD trend side                |
-//| (g_prCloseOldSide).  This helper is called every tick afterwards: |
-//|   1) Iterate every managed PR-AVG-* position on the marked side,  |
-//|      summing realized+unrealized PnL (Profit + Swap + Commission).|
-//|   2) If no such positions remain (TP/overlap/etc closed them all),|
-//|      disarm and persist.                                          |
-//|   3) If sum >= InpOldGridCloseProfit, close the entire batch in   |
-//|      one pass and disarm.  We decrement g_prAvgCount* per closed  |
-//|      ticket so a fresh chain on the new side keeps its multiplier |
-//|      starting from zero (paired with InpRestartGridOnTrendFlip).  |
-//| Note: only PR-AVG-B / PR-AVG-S are flushed.  Lock leg(s)          |
-//| (PR-LOCK) and the original losing positions are NOT touched here. |
-//+------------------------------------------------------------------+
-void TryCloseOldGridByProfit()
-  {
-   if(!g_prCloseOldActive) return;
-
-   string tag = (g_prCloseOldSide == POSITION_TYPE_BUY) ? "PR-AVG-B" : "PR-AVG-S";
-
-   ulong  tickets[];
-   double sum = 0.0;
-   int    total = PositionsTotal();
-   for(int i = 0; i < total; i++)
-     {
-      ulong tk = PositionGetTicket(i);
-      if(!IsManaged(tk)) continue;                       // also selects pos
-      if(pos.PositionType() != g_prCloseOldSide) continue;
-      if(StringFind(pos.Comment(), tag) < 0) continue;
-      sum += pos.Profit() + pos.Swap() + pos.Commission();
-      int n = ArraySize(tickets); ArrayResize(tickets, n + 1); tickets[n] = tk;
-     }
-
-   if(ArraySize(tickets) == 0)
-     {
-      // Nothing left on the marked side -> auto-disarm.
-      g_prCloseOldActive = false;
-      if(InpUsePersistence) SaveState();
-      return;
-     }
-
-   if(sum < InpOldGridCloseProfit) return;  // wait for combined profit
-
-   int closed = 0;
-   for(int i = 0; i < ArraySize(tickets); i++)
-     {
-      if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
-        {
-         closed++;
-         if(g_prCloseOldSide == POSITION_TYPE_BUY)
-            g_prAvgCountBuy  = MathMax(0, g_prAvgCountBuy  - 1);
-         else
-            g_prAvgCountSell = MathMax(0, g_prAvgCountSell - 1);
-        }
-     }
-   PrintFormat("PR: closed old %s grid: %d/%d avg, profit=%.2f (target>=%.2f)",
-               g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
-               closed, ArraySize(tickets), sum, InpOldGridCloseProfit);
-   Notify(StringFormat("PR: old %s grid flushed (%d avg, +%.2f)",
-                       g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL",
-                       closed, sum));
-   g_prCloseOldActive = false;
-   if(InpUsePersistence) SaveState();
-  }
-
-//+------------------------------------------------------------------+
-//| Sum total volume of ALL managed positions, separately for each   |
-//| direction.  Counts every group the EA considers managed: PR-AVG, |
-//| PR-LOCK, originals (no PR-* tag), AVG-*, GRID-*, MANUAL-LOCK,    |
-//| etc.  Generic helper kept for diagnostics / future use.           |
-//| Note: v1.51 trim no longer uses this — TrimStrongSideToWeak now  |
-//| computes lockVol / origVol separately and only trims the LOCK.   |
-//+------------------------------------------------------------------+
-void ComputeManagedNetVolumes(double &buyVol, double &sellVol)
-  {
-   buyVol  = 0.0;
-   sellVol = 0.0;
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;                       // also selects pos
-      double v = pos.Volume();
-      if(pos.PositionType() == POSITION_TYPE_BUY)       buyVol  += v;
-      else if(pos.PositionType() == POSITION_TYPE_SELL) sellVol += v;
-     }
-  }
-
-//+------------------------------------------------------------------+
-//| TrimStrongSideToWeak (v1.51 - lock-targeted).                    |
-//| Called once at trend-flip time when InpTrendFlipTrimStrong=true. |
-//|                                                                  |
-//| Прежняя реализация (v1.50) суммировала объёмы ВСЕХ managed-      |
-//| позиций по сторонам и закрывала «сильную» сторону до «слабой»,   |
-//| сортируя по PnL DESC. У лока обычно наибольший абсолютный PnL    |
-//| (крупный объём), поэтому он попадал первым в очередь и забирал   |
-//| весь diff на себя — включая объём открытых усреднителей. В       |
-//| итоге пользователь видел, что лок закрывается полностью или      |
-//| гораздо сильнее, чем ожидалось.                                  |
-//|                                                                  |
-//| Новая логика: считаем строго                                     |
-//|   * lockVolBuy  / lockVolSell  — суммарный объём PR-LOCK по сторонам|
-//|   * origVolBuy  / origVolSell  — суммарный объём «оригиналов»    |
-//|     (managed-позиции БЕЗ тегов PR-AVG / PR-LOCK)                 |
-//| и режем именно LOCK на стороне, где он есть, до объёма оригинала |
-//| на противоположной стороне. Усреднители и однонаправленные с     |
-//| локом оригиналы в расчёте не участвуют и trim-ом не трогаются.   |
-//|                                                                  |
-//| Пример пользователя:                                             |
-//|   SELL original 1.0 → чип 0.2 → 0.8                               |
-//|   PR-LOCK BUY 1.0                                                |
-//|   trend flip → diff = lockBuy(1.0) − origSell(0.8) = 0.2          |
-//|   LOCK BUY режется на 0.2 → 0.8                                  |
-//|   итог: SELL 0.80 / lock BUY 0.80, усреднители (если ещё открыты) |
-//|   не трогаются и закрываются по своему TP / по                   |
-//|   InpCloseOldGridOnTrendFlip.                                    |
-//|                                                                  |
-//| Crap-cases (no-op):                                               |
-//|   * лока нет ни на одной стороне → нечего тримить                 |
-//|   * лок одновременно и на BUY и на SELL (нештатно) → не трогаем,  |
-//|     чтобы не разрулить лок-пару непредсказуемо                    |
-//|   * diff < minLot брокера → уже сбалансировано                    |
-//|                                                                  |
-//| После trim-а g_prAvgCount{Buy,Sell} НЕ требуют пересчёта (мы не   |
-//| трогали PR-AVG-*), но всё равно делаем скан для consistency, на  |
-//| случай если в будущем поменяется стратегия отбора целей.         |
-//+------------------------------------------------------------------+
-void TrimStrongSideToWeak()
-  {
-   double lockBuy  = 0.0, lockSell = 0.0;
-   double origBuy  = 0.0, origSell = 0.0;
-
-   int total = PositionsTotal();
-   for(int i = 0; i < total; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;                       // also selects pos
-      double v = pos.Volume();
-      ENUM_POSITION_TYPE pt = pos.PositionType();
-      string cmt = pos.Comment();
-
-      if(StringFind(cmt, "PR-LOCK") >= 0)
-        {
-         if(pt == POSITION_TYPE_BUY)       lockBuy  += v;
-         else if(pt == POSITION_TYPE_SELL) lockSell += v;
-        }
-      else if(StringFind(cmt, "PR-AVG") < 0)
-        {
-         // not lock, not averager => "original" (manual / loser / pre-existing)
-         if(pt == POSITION_TYPE_BUY)       origBuy  += v;
-         else if(pt == POSITION_TYPE_SELL) origSell += v;
-        }
-      // PR-AVG-* are intentionally ignored — trim must NOT touch them.
-     }
-
-   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-
-   bool hasLockBuy  = (lockBuy  >= minLot);
-   bool hasLockSell = (lockSell >= minLot);
-
-   // No clear single-sided lock -> nothing to trim.
-   if(hasLockBuy == hasLockSell)
-     {
-      if(hasLockBuy && hasLockSell)
-         Print("PR trim: lock present on BOTH sides, skipping trim (manual review needed)");
-      return;
-     }
-
-   ENUM_POSITION_TYPE strong;
-   double currentLockVol;
-   double oppositeOrigVol;
-
-   if(hasLockBuy)
-     {
-      strong          = POSITION_TYPE_BUY;
-      currentLockVol  = lockBuy;
-      oppositeOrigVol = origSell;
-     }
-   else
-     {
-      strong          = POSITION_TYPE_SELL;
-      currentLockVol  = lockSell;
-      oppositeOrigVol = origBuy;
-     }
-
-   double diff = currentLockVol - oppositeOrigVol;
-   if(diff < minLot)
-     {
-      // lock already <= opposite original (e.g. someone partially closed
-      // the lock manually) -> nothing to trim.
-      return;
-     }
-
-   // --- Collect PR-LOCK tickets on the strong side --------------------
-   ulong  tickets[];
-   double profits[];
-   int t1 = PositionsTotal();
-   for(int i = 0; i < t1; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;
-      if(pos.PositionType() != strong) continue;
-      if(StringFind(pos.Comment(), "PR-LOCK") < 0) continue;
-      double pnl = pos.Profit() + pos.Swap() + pos.Commission();
-      int n = ArraySize(tickets);
-      ArrayResize(tickets, n + 1);
-      ArrayResize(profits, n + 1);
-      tickets[n] = t;
-      profits[n] = pnl;
-     }
-
-   int N = ArraySize(tickets);
-   if(N == 0) return;
-
-   // Sort DESC by PnL (most profitable lock-leg goes first).  In the
-   // typical case there's exactly one lock leg and the sort is a no-op.
-   for(int a = 0; a < N - 1; a++)
-      for(int b = a + 1; b < N; b++)
-         if(profits[b] > profits[a])
-           {
-            double tp = profits[a]; profits[a] = profits[b]; profits[b] = tp;
-            ulong  tt = tickets[a]; tickets[a] = tickets[b]; tickets[b] = tt;
-           }
-
-   double remaining      = diff;
-   int    closedFull     = 0;
-   int    closedPart     = 0;
-   double closedVolTotal = 0.0;
-
-   for(int i = 0; i < N && remaining >= minLot; i++)
-     {
-      if(!pos.SelectByTicket(tickets[i])) continue;
-      double posVol = pos.Volume();
-
-      if(posVol <= remaining + 1e-9)
-        {
-         // Full close of this lock leg
-         if(trade.PositionClose(tickets[i], (ulong)InpSlippage))
-           {
-            closedFull++;
-            closedVolTotal += posVol;
-            remaining      -= posVol;
-           }
-         else
-           {
-            PrintFormat("PR trim: PositionClose lock #%I64u failed err=%d ret=%d",
-                        tickets[i], GetLastError(), trade.ResultRetcode());
-           }
-        }
-      else
-        {
-         // Partial close to land exactly on the matching volume
-         if(ClosePartOfPosition(tickets[i], remaining))
-           {
-            closedPart++;
-            closedVolTotal += remaining;
-            remaining       = 0.0;
-           }
-         else
-           {
-            PrintFormat("PR trim: ClosePartOfPosition lock #%I64u %.4f failed",
-                        tickets[i], remaining);
-           }
-        }
-     }
-
-   if(closedFull == 0 && closedPart == 0) return;
-
-   // PR-AVG-* were not touched, but rescan counters for safety/consistency.
-   int avgB = 0, avgS = 0;
-   int t2 = PositionsTotal();
-   for(int i = 0; i < t2; i++)
-     {
-      ulong t = PositionGetTicket(i);
-      if(!IsManaged(t)) continue;
-      string cmt = pos.Comment();
-      if(StringFind(cmt, "PR-AVG-B") >= 0)      avgB++;
-      else if(StringFind(cmt, "PR-AVG-S") >= 0) avgS++;
-     }
-   g_prAvgCountBuy  = avgB;
-   g_prAvgCountSell = avgS;
-
-   PrintFormat("PR trend-flip trim LOCK: %s side -%.4f lot (%d full, %d partial), "
-               "lock %.4f -> %.4f to match opp original %.4f",
-               strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
-               closedVolTotal, closedFull, closedPart,
-               currentLockVol, currentLockVol - closedVolTotal, oppositeOrigVol);
-   Notify(StringFormat("PR trim lock %s -%.4f lot (match opp orig %.4f)",
-                       strong == POSITION_TYPE_BUY ? "BUY" : "SELL",
-                       closedVolTotal, oppositeOrigVol));
-
-   if(InpUsePersistence) SaveState();
   }
 
 //+------------------------------------------------------------------+
@@ -2768,6 +2123,264 @@ void ProcessProfitableAveragers(const BasketState &bs)
   }
 
 //+------------------------------------------------------------------+
+//| v1.60: Manual averager open (Mode 5 only).                       |
+//|                                                                  |
+//| Triggered by the "Avg Now" panel button.  Opens one PR-AVG-{B|S} |
+//| on the side currently preferred by the recovery loop, ignoring   |
+//| step/bar gates but still respecting MaxAveragers, MaxTrades,     |
+//| SpreadOK and EmergencyStop.  Lot is computed by the same         |
+//| ComputeAvgLot helper that DoPartialRecovery uses, so the manual  |
+//| pick honours InpAvgLotMode / InpAvgLotPctOfLosing /              |
+//| InpAvgLotPerLossUSD.  The Slow Start cap is also honoured so     |
+//| this button cannot bypass risk-shaping.                          |
+//+------------------------------------------------------------------+
+void DoManualAvgNow()
+  {
+   if(InpMode != MODE_PARTIAL_RECOVERY)
+     {
+      Print("Avg Now: only valid in MODE_PARTIAL_RECOVERY (current Mode=", (int)InpMode, ")");
+      Notify("Avg Now: only valid in Mode 5");
+      return;
+     }
+   if(InpSymbolScope != SCOPE_CURRENT)
+     {
+      Print("Avg Now: requires SCOPE_CURRENT");
+      Notify("Avg Now: SCOPE_CURRENT required");
+      return;
+     }
+   if(g_emergencyStop)
+     {
+      Print("Avg Now blocked: emergency stop active. Press 'Reset Stop' first.");
+      Notify("Avg Now blocked: EMERGENCY STOP");
+      return;
+     }
+   if(!SpreadOK(_Symbol))
+     {
+      PrintFormat("Avg Now blocked: spread > InpMaxSpreadPts=%.0f", InpMaxSpreadPts);
+      Notify("Avg Now blocked: spread too wide");
+      return;
+     }
+
+   BasketState bs; BuildBasket(bs);
+   if(bs.count == 0)
+     {
+      Print("Avg Now: basket empty, nothing to average");
+      Notify("Avg Now: basket empty");
+      return;
+     }
+   if(bs.count >= InpMaxTrades)
+     {
+      PrintFormat("Avg Now blocked: basket %d >= InpMaxTrades %d", bs.count, InpMaxTrades);
+      Notify("Avg Now blocked: MaxTrades reached");
+      return;
+     }
+
+   // Pick side: opposite the heavier losing side (same as auto loop).
+   ENUM_ORDER_TYPE side = (bs.sellProfit < bs.buyProfit) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+   // Honour Slow Start cap (so the manual button can't bypass risk-shaping).
+   int chainIdx = (side == ORDER_TYPE_BUY) ? g_prAvgCountBuy : g_prAvgCountSell;
+   int slowCap  = InpMaxAveragers;
+   if(InpUseSlowStart && InpSlowStartLossStepUSD > 0 && InpSlowStartLossSteps > 0)
+     {
+      double curLoss = (bs.profit < 0) ? -bs.profit : 0.0;
+      int bucket = (int)MathFloor(curLoss / InpSlowStartLossStepUSD);
+      if(bucket < 0)                       bucket = 0;
+      if(bucket > InpSlowStartLossSteps)   bucket = InpSlowStartLossSteps;
+      slowCap = MathMin(InpMaxAveragers, bucket);
+     }
+   if(chainIdx >= slowCap)
+     {
+      PrintFormat("Avg Now blocked: chain %d on %s side >= cap %d (SlowStart=%d)",
+                  chainIdx, (side == ORDER_TYPE_BUY ? "BUY" : "SELL"),
+                  slowCap, (int)InpUseSlowStart);
+      Notify("Avg Now blocked: chain cap reached");
+      return;
+     }
+
+   // Lot via ComputeAvgLot (same lot-mode logic as the auto loop).
+   double losingSideVol = 0.0;
+   double floatingLossUSD = (bs.profit < 0) ? -bs.profit : 0.0;
+   {
+      int total = PositionsTotal();
+      ENUM_POSITION_TYPE losingTarget = (side == ORDER_TYPE_BUY) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
+      for(int i = 0; i < total; i++)
+        {
+         ulong t = PositionGetTicket(i);
+         if(!IsManaged(t)) continue;
+         string cmt = pos.Comment();
+         if(StringFind(cmt, "PR-AVG") >= 0) continue;
+         if(pos.PositionType() != losingTarget) continue;
+         double pft = pos.Profit() + pos.Swap() + pos.Commission();
+         if(pft >= 0) continue;
+         losingSideVol += pos.Volume();
+        }
+   }
+   double lot = ComputeAvgLot(chainIdx, losingSideVol, floatingLossUSD);
+   if(lot <= 0)
+     {
+      Print("Avg Now: ComputeAvgLot returned 0 — check lot-mode inputs");
+      Notify("Avg Now: lot computation failed");
+      return;
+     }
+
+   string tag = (side == ORDER_TYPE_BUY) ? "PR-AVG-B" : "PR-AVG-S";
+   if(OpenPosition(_Symbol, side, lot, tag))
+     {
+      if(side == ORDER_TYPE_BUY) g_prAvgCountBuy++;
+      else                       g_prAvgCountSell++;
+      PrintFormat("Avg Now: opened %s %.2f (%s, chainIdx %d -> %d)",
+                  (side == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, tag,
+                  chainIdx, chainIdx + 1);
+      Notify(StringFormat("Avg Now: %s %.2f opened on %s",
+                          (side == ORDER_TYPE_BUY ? "BUY" : "SELL"), lot, _Symbol));
+      if(InpUsePersistence) SaveState();
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| v1.60: TP-zone HLINE updater.                                    |
+//|                                                                  |
+//| Solves for the price at which the current basket's combined PnL  |
+//| reaches InpTargetProfit and draws a horizontal line at that      |
+//| price.  PER_SIDE basket draws two lines (BUY target + SELL       |
+//| target).  COMBINED basket draws a single line.  Hidden when:     |
+//|   * InpDrawTPLine == false                                       |
+//|   * basket has no managed positions                              |
+//|   * the volume-imbalance denominator is ~0 (perfectly hedged     |
+//|     basket — TP is unreachable by price alone, only by closing). |
+//|                                                                  |
+//| Math (COMBINED, per-tick):                                        |
+//|   pnl(price) = sum_i lot_i * sign_i * (price - price_i) * vp     |
+//|   where sign_i = +1 for BUY, -1 for SELL                          |
+//|         vp = tickValue / tickSize  (deposit currency per price)   |
+//|   Solve pnl == target:                                            |
+//|     target/vp = sum_i lot_i*sign_i*price - sum_i lot_i*sign_i*pi |
+//|     price    = (target/vp + sum_i lot_i*sign_i*pi) / netLotSign  |
+//+------------------------------------------------------------------+
+void UpdateTPLine(const BasketState &bs)
+  {
+   const string nameC = TPLINE_COMBINED;
+   const string nameB = TPLINE_BUY;
+   const string nameS = TPLINE_SELL;
+
+   // Hide-and-return helper: erase any leftover lines.
+   if(!InpDrawTPLine || bs.count == 0)
+     {
+      if(ObjectFind(0, nameC) >= 0) ObjectDelete(0, nameC);
+      if(ObjectFind(0, nameB) >= 0) ObjectDelete(0, nameB);
+      if(ObjectFind(0, nameS) >= 0) ObjectDelete(0, nameS);
+      return;
+     }
+
+   double tv = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double ts = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double vp = (ts > 0) ? tv / ts : 0.0;
+   if(vp <= 0)
+     {
+      if(ObjectFind(0, nameC) >= 0) ObjectDelete(0, nameC);
+      if(ObjectFind(0, nameB) >= 0) ObjectDelete(0, nameB);
+      if(ObjectFind(0, nameS) >= 0) ObjectDelete(0, nameS);
+      return;
+     }
+
+   if(InpBasketMode == BASKET_COMBINED)
+     {
+      if(ObjectFind(0, nameB) >= 0) ObjectDelete(0, nameB);
+      if(ObjectFind(0, nameS) >= 0) ObjectDelete(0, nameS);
+
+      double netLotSign = bs.buyVolume - bs.sellVolume;
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      if(MathAbs(netLotSign) < MathMax(minLot, 1e-6))
+        {
+         if(ObjectFind(0, nameC) >= 0) ObjectDelete(0, nameC);
+         return;  // perfectly hedged basket — no price-level TP exists
+        }
+      double sumSigned = bs.buyVolume * bs.buyPriceAvg - bs.sellVolume * bs.sellPriceAvg;
+      double target    = ResolveTargetMoney(bs.buyVolume + bs.sellVolume);
+      double tpPrice   = (target / vp + sumSigned) / netLotSign;
+      tpPrice = NormalizeDouble(tpPrice, _Digits);
+
+      if(ObjectFind(0, nameC) < 0)
+        {
+         ObjectCreate(0, nameC, OBJ_HLINE, 0, 0, tpPrice);
+         ObjectSetInteger(0, nameC, OBJPROP_COLOR, InpTPLineColor);
+         ObjectSetInteger(0, nameC, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, nameC, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nameC, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nameC, OBJPROP_SELECTABLE, false);
+         ObjectSetString(0, nameC, OBJPROP_TOOLTIP,
+                         StringFormat("RECOVERI TP: basket -> +%.2f", target));
+        }
+      else
+        {
+         ObjectSetDouble(0, nameC, OBJPROP_PRICE, tpPrice);
+         ObjectSetInteger(0, nameC, OBJPROP_COLOR, InpTPLineColor);
+         ObjectSetString(0, nameC, OBJPROP_TOOLTIP,
+                         StringFormat("RECOVERI TP: basket -> +%.2f", target));
+        }
+      return;
+     }
+
+   // PER_SIDE: independent TP price for each side.  For a single-side
+   // basket pnl = lot * sign * (price - avgPrice) * vp = target
+   //  => price = avgPrice + sign * target/(vp*lot)
+   if(ObjectFind(0, nameC) >= 0) ObjectDelete(0, nameC);
+
+   if(bs.buyVolume > 0)
+     {
+      double tgtB    = ResolveTargetMoney(bs.buyVolume);
+      double tpPrice = bs.buyPriceAvg + tgtB / (vp * bs.buyVolume);
+      tpPrice = NormalizeDouble(tpPrice, _Digits);
+      if(ObjectFind(0, nameB) < 0)
+        {
+         ObjectCreate(0, nameB, OBJ_HLINE, 0, 0, tpPrice);
+         ObjectSetInteger(0, nameB, OBJPROP_COLOR, InpTPLineColor);
+         ObjectSetInteger(0, nameB, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, nameB, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nameB, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nameB, OBJPROP_SELECTABLE, false);
+         ObjectSetString(0, nameB, OBJPROP_TOOLTIP,
+                         StringFormat("RECOVERI TP BUY: -> +%.2f", tgtB));
+        }
+      else
+        {
+         ObjectSetDouble(0, nameB, OBJPROP_PRICE, tpPrice);
+         ObjectSetInteger(0, nameB, OBJPROP_COLOR, InpTPLineColor);
+         ObjectSetString(0, nameB, OBJPROP_TOOLTIP,
+                         StringFormat("RECOVERI TP BUY: -> +%.2f", tgtB));
+        }
+     }
+   else if(ObjectFind(0, nameB) >= 0) ObjectDelete(0, nameB);
+
+   if(bs.sellVolume > 0)
+     {
+      double tgtS    = ResolveTargetMoney(bs.sellVolume);
+      double tpPrice = bs.sellPriceAvg - tgtS / (vp * bs.sellVolume);
+      tpPrice = NormalizeDouble(tpPrice, _Digits);
+      if(ObjectFind(0, nameS) < 0)
+        {
+         ObjectCreate(0, nameS, OBJ_HLINE, 0, 0, tpPrice);
+         ObjectSetInteger(0, nameS, OBJPROP_COLOR, InpTPLineColor);
+         ObjectSetInteger(0, nameS, OBJPROP_STYLE, STYLE_DASH);
+         ObjectSetInteger(0, nameS, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, nameS, OBJPROP_BACK, true);
+         ObjectSetInteger(0, nameS, OBJPROP_SELECTABLE, false);
+         ObjectSetString(0, nameS, OBJPROP_TOOLTIP,
+                         StringFormat("RECOVERI TP SELL: -> +%.2f", tgtS));
+        }
+      else
+        {
+         ObjectSetDouble(0, nameS, OBJPROP_PRICE, tpPrice);
+         ObjectSetInteger(0, nameS, OBJPROP_COLOR, InpTPLineColor);
+         ObjectSetString(0, nameS, OBJPROP_TOOLTIP,
+                         StringFormat("RECOVERI TP SELL: -> +%.2f", tgtS));
+        }
+     }
+   else if(ObjectFind(0, nameS) >= 0) ObjectDelete(0, nameS);
+  }
+
+//+------------------------------------------------------------------+
 //| Open a market order with the EA's magic number                   |
 //+------------------------------------------------------------------+
 bool OpenPosition(const string symbol, const ENUM_ORDER_TYPE type, double lot, const string tag)
@@ -2835,14 +2448,37 @@ void CreateButton(const string name, int x, int y, int w, int h,
 
 void CreatePanel()
   {
-   string lines[] = {"title","mode","scope","basket","count","buy","sell","profit",
-                     "peak","target","lock","align","filter","stop"};
+   // v1.60: panel labels in display order.  "recovery" line is filled
+   // when a recovery cycle is active; "stat" hosts the coloured status
+   // square (drawn as a rectangle label, BGCOLOR carries the meaning).
+   string lines[] = {"title","stat","mode","scope","basket","count","buy","sell","profit",
+                     "peak","target","recovery","lock","align","filter","stop"};
    int y = 20;
    for(int i=0; i<ArraySize(lines); i++)
      {
       CreateLabel(lines[i], 10, y);
       y += InpPanelFontSize + 6;
      }
+   // v1.60: status colour square — small filled rectangle anchored next
+   // to the title line.  We use a separate object name with the same
+   // panel prefix so OnDeinit's ObjectsDeleteAll wipes it for free.
+   {
+      const string sname = g_panelPrefix + "stat_box";
+      if(ObjectFind(0, sname) < 0)
+        {
+         ObjectCreate(0, sname, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, sname, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+         ObjectSetInteger(0, sname, OBJPROP_XDISTANCE, 195);
+         ObjectSetInteger(0, sname, OBJPROP_YDISTANCE, 20 + (InpPanelFontSize + 6));
+         ObjectSetInteger(0, sname, OBJPROP_XSIZE, 14);
+         ObjectSetInteger(0, sname, OBJPROP_YSIZE, 14);
+         ObjectSetInteger(0, sname, OBJPROP_BGCOLOR, clrSilver);
+         ObjectSetInteger(0, sname, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+         ObjectSetInteger(0, sname, OBJPROP_COLOR, clrDimGray);
+         ObjectSetInteger(0, sname, OBJPROP_BACK, false);
+         ObjectSetInteger(0, sname, OBJPROP_SELECTABLE, false);
+        }
+   }
    int btnY = y + 6;
    int bw = 90, bh = 22, gap = 6;
    CreateButton(BTN_CLOSE_ALL,  10,            btnY,             bw, bh, "Close All",  clrFireBrick, clrWhite);
@@ -2852,6 +2488,9 @@ void CreatePanel()
    CreateButton(BTN_LOCK,       10,            btnY+2*(bh+gap),  bw, bh, "Lock Now",   clrGoldenrod, clrBlack);
    CreateButton(BTN_RESET,      10+bw+gap,     btnY+2*(bh+gap),  bw, bh, "Reset Stop", clrDarkGreen, clrWhite);
    CreateButton(BTN_RESET_STATE,10+bw+gap,     btnY+3*(bh+gap),  bw, bh, "Reset State",clrDarkSlateBlue, clrWhite);
+   // v1.60: Avg Now button — only useful in Mode 5; shown by toggle.
+   if(InpShowAvgNowButton && InpMode == MODE_PARTIAL_RECOVERY)
+      CreateButton(BTN_AVG_NOW,  10,           btnY+3*(bh+gap),  bw, bh, "Avg Now",    clrSeaGreen,      clrWhite);
    if(InpShowManualButtons)
      {
       // Lot label above the manual row
@@ -2894,7 +2533,7 @@ void UpdatePanel(const BasketState &bs)
    double tgtSell = ResolveTargetMoney(bs.sellVolume);
    color profitClr = (bs.profit >= 0) ? clrLime : clrTomato;
 
-   SetLabel("title",  "=== RECOVERI v1.52 ULTIMATE ===", clrGold);
+   SetLabel("title",  "=== RECOVERI v1.60 (AW-aligned) ===", clrGold);
    SetLabel("mode",   StringFormat("Mode  : %s%s", modeName, InpCloseOnly?" [CLOSE-ONLY]":""));
    SetLabel("scope",  StringFormat("Manage: %s @ %s", scopeName, symScope));
    SetLabel("basket", StringFormat("Basket: %s", basketName));
@@ -2914,6 +2553,25 @@ void UpdatePanel(const BasketState &bs)
      {
       SetLabel("peak",   StringFormat("Peak  : B=%.2f S=%.2f", g_peakBuyProfit, g_peakSellProfit));
       SetLabel("target", StringFormat("Target: B=%.2f S=%.2f", tgtBuy, tgtSell));
+     }
+
+   // v1.60: Recovery% — fraction of the captured initial drawdown that
+   // has been recovered.  Active only when a baseline was captured (i.e.
+   // trigger fired AND we entered a loss in the current cycle) AND we
+   // still have managed positions on chart.  Hidden otherwise.
+   if(g_initialDrawdown > 0 && bs.count > 0)
+     {
+      double curLoss = (bs.profit < 0) ? -bs.profit : 0.0;
+      double pct = (1.0 - curLoss / g_initialDrawdown) * 100.0;
+      if(pct < -100.0) pct = -100.0;
+      if(pct >  100.0) pct =  100.0;
+      color recClr = (pct >= 0) ? clrLightGreen : clrTomato;
+      SetLabel("recovery", StringFormat("Recovery: %.1f%%  (%.2f -> %.2f)",
+                                        pct, -g_initialDrawdown, bs.profit), recClr);
+     }
+   else
+     {
+      SetLabel("recovery", "Recovery: -", clrLightGray);
      }
 
    // Lock-unwind status / Partial-Recovery status
@@ -2959,9 +2617,10 @@ void UpdatePanel(const BasketState &bs)
      }
 
 
-   // v1.52: ATR-grid + TF-align status. Always emitted (line is permanent
-   // in CreatePanel) — when both blocks are off we just show "off" so the
-   // user can see at a glance that no extra logic is active.
+   // v1.60: ATR-grid status + Slow Start bucket + lot mode summary.
+   // The line is permanent in CreatePanel — when no extras are active we
+   // still print compact defaults so the user can see geometry at a
+   // glance.
    {
       string atrPart = "off";
       if(InpAvgStepUseATR)
@@ -2982,25 +2641,28 @@ void UpdatePanel(const BasketState &bs)
                                 InpAvgStepATRPeriod, InpAvgStepATRMul, basePts);
         }
 
-      string algPart = "off";
-      if(InpLockAlignUseTF)
+      // Slow Start bucket index (current cap on side chain length).
+      string slowPart = "off";
+      if(InpUseSlowStart && InpSlowStartLossStepUSD > 0 && InpSlowStartLossSteps > 0)
         {
-         double bv = 0, sv = 0;
-         int total = PositionsTotal();
-         for(int i = 0; i < total; i++)
-           {
-            ulong t = PositionGetTicket(i);
-            if(!IsManaged(t)) continue;
-            double v = pos.Volume();
-            if(pos.PositionType() == POSITION_TYPE_BUY)       bv += v;
-            else if(pos.PositionType() == POSITION_TYPE_SELL) sv += v;
-           }
-         double imb = bv - sv;
-         algPart = StringFormat("Align(%s) imb=%+.2f%s",
-                                EnumToString(InpLockAlignTF), imb,
-                                InpLockAlignOnlyProfit ? " +zone" : "");
+         double curLoss = (bs.profit < 0) ? -bs.profit : 0.0;
+         int bucket = (int)MathFloor(curLoss / InpSlowStartLossStepUSD);
+         if(bucket < 0)                       bucket = 0;
+         if(bucket > InpSlowStartLossSteps)   bucket = InpSlowStartLossSteps;
+         int slowCap = MathMin(InpMaxAveragers, bucket);
+         slowPart = StringFormat("SlowStart=%d/%d", slowCap, InpSlowStartLossSteps);
         }
-      SetLabel("align", StringFormat("Step:%s | %s", atrPart, algPart));
+
+      // Averager lot mode short tag.
+      string lotPart = "FIXED";
+      switch(InpAvgLotMode)
+        {
+         case AVG_LOT_FIXED:         lotPart = "FIXED";       break;
+         case AVG_LOT_PCT_OF_LOSING: lotPart = StringFormat("PCT=%.1f%%", InpAvgLotPctOfLosing); break;
+         case AVG_LOT_FROM_LOSS_USD: lotPart = StringFormat("FROM-LOSS=%.4f", InpAvgLotPerLossUSD); break;
+         case AVG_LOT_MAX_OF_ALL:    lotPart = "MAX";         break;
+        }
+      SetLabel("align", StringFormat("Step:%s | %s | Lot:%s", atrPart, slowPart, lotPart));
    }
 
    string filt = "Filter:";
@@ -3017,9 +2679,34 @@ void UpdatePanel(const BasketState &bs)
    else                { statusText = "STATUS: OK";              statusClr = clrLime; }
    SetLabel("stop", statusText, statusClr);
 
+   // v1.60: panel status colour box.  Aggregates the same signals as the
+   // "STATUS:" text line above plus the recovery cycle phase, so a quick
+   // glance at the colour conveys the high-level state.
+   //   red      = emergency stop active
+   //   orange   = paused or blocked by time/news filters
+   //   lime     = recovery cycle running (positions on chart)
+   //   gold     = standby — start trigger configured but not yet fired
+   //   silver   = idle (no managed positions, no trigger pending)
+   {
+      color statBg = clrSilver;
+      if(g_emergencyStop)                                   statBg = clrRed;
+      else if(g_paused || g_blockReason != "")              statBg = clrOrange;
+      else if(bs.count > 0 || g_recoveryTriggered)          statBg = clrLime;
+      else if(InpStartTrigger != START_INSTANT)             statBg = clrGold;
+      const string sname = g_panelPrefix + "stat_box";
+      if(ObjectFind(0, sname) >= 0)
+         ObjectSetInteger(0, sname, OBJPROP_BGCOLOR, statBg);
+   }
+
    ObjectSetString(0, BTN_PAUSE, OBJPROP_TEXT, g_paused ? "Resume" : "Pause");
    if(InpShowManualButtons)
       SetLabel("manualLot", StringFormat("Manual lot: %.2f", InpManualLot), clrLightGray);
+
+   // v1.60: TP-zone HLINE(s).  Recomputed every tick from current basket
+   // weighted-entry vs InpTargetProfit.  Hidden when InpDrawTPLine=false
+   // or basket is empty / perfectly hedged.
+   UpdateTPLine(bs);
+
    ChartRedraw(0);
   }
 //+------------------------------------------------------------------+
@@ -3146,12 +2833,9 @@ void SaveState()
    GlobalVariableSet(g_gvPrefix + "BASE_BAL",g_baselineBalance);
    GlobalVariableSet(g_gvPrefix + "OEAS_DIS",g_otherEAsDisabled  ? 1.0 : 0.0);
    GlobalVariableSet(g_gvPrefix + "PR_PH",   (double)g_prPhase);
-   GlobalVariableSet(g_gvPrefix + "PR_COA",  g_prCloseOldActive ? 1.0 : 0.0);
-   GlobalVariableSet(g_gvPrefix + "PR_COS",  (g_prCloseOldSide == POSITION_TYPE_BUY) ? 0.0 : 1.0);
-   // v1.53: seed-lot machinery
-   GlobalVariableSet(g_gvPrefix + "PR_SLA",  g_prSeedActive ? 1.0 : 0.0);
-   GlobalVariableSet(g_gvPrefix + "PR_SLS",  (g_prSeedSide == POSITION_TYPE_BUY) ? 0.0 : 1.0);
-   GlobalVariableSet(g_gvPrefix + "PR_SLT",  g_prSeedLot);
+   // v1.60: initial drawdown for Recovery% panel readout.  Cleared on
+   // PR_IDLE re-entry / mode change / Reset State.
+   GlobalVariableSet(g_gvPrefix + "RC_DD0",  g_initialDrawdown);
 
    // Wipe stale BE/TSL globals for tickets no longer present
    int total = GlobalVariablesTotal();
@@ -3182,8 +2866,10 @@ ENUM_LOAD_STATUS LoadState()
    // Detect any pre-existing state at all (for clean-vs-legacy distinction)
    string allKeys[] = {"PAUSED","ESTOP","PEAK_C","PEAK_B","PEAK_S","GRID","BASE_BAL",
                        "LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
-                       "RC_TRIG","OEAS_DIS","PR_PH","PR_COA","PR_COS",
-                       "PR_SLA","PR_SLS","PR_SLT"};
+                       "RC_TRIG","OEAS_DIS","PR_PH","RC_DD0",
+                       // v1.43–1.53 legacy keys, kept here for migration
+                       // detection — never written by v1.60+.
+                       "PR_COA","PR_COS","PR_SLA","PR_SLS","PR_SLT"};
    bool anyState = false;
    for(int i = 0; i < ArraySize(allKeys); i++)
       if(GlobalVariableCheck(g_gvPrefix + allKeys[i])) { anyState = true; break; }
@@ -3202,12 +2888,17 @@ ENUM_LOAD_STATUS LoadState()
    if(GlobalVariableCheck(g_gvPrefix + "BASE_BAL")) g_baselineBalance = GlobalVariableGet(g_gvPrefix + "BASE_BAL");
 
    // --- Mode-specific keys: load only if mode matches; otherwise reset to defaults ---
+   // v1.60: PR_COA, PR_COS, PR_SLA, PR_SLS, PR_SLT are kept in staleKeys[]
+   // even though the v1.60 code path no longer writes/reads them, so that
+   // upgrading from v1.43–1.53 wipes any residual GV from previous runs.
+   // RC_DD0 is the new mode-specific key for the Recovery% baseline.
    if(ignoreModeKeys)
      {
       // Wipe stale keys so they don't poison future loads.
       string staleKeys[] = {"LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
-                            "RC_TRIG","OEAS_DIS","PR_PH","PR_COA","PR_COS",
-                            "PR_SLA","PR_SLS","PR_SLT"};
+                            "RC_TRIG","OEAS_DIS","PR_PH","RC_DD0",
+                            // v1.43–1.53 legacy keys (forward migration nuke)
+                            "PR_COA","PR_COS","PR_SLA","PR_SLS","PR_SLT"};
       for(int i = 0; i < ArraySize(staleKeys); i++)
         {
          string k = g_gvPrefix + staleKeys[i];
@@ -3221,11 +2912,7 @@ ENUM_LOAD_STATUS LoadState()
       g_recoveryTriggered = false;
       g_otherEAsDisabled  = false;
       g_prPhase           = PR_IDLE;
-      g_prCloseOldActive  = false;
-      g_prCloseOldSide    = POSITION_TYPE_BUY;
-      g_prSeedActive      = false;
-      g_prSeedSide        = POSITION_TYPE_BUY;
-      g_prSeedLot         = 0.0;
+      g_initialDrawdown   = 0.0;
      }
    else
      {
@@ -3237,12 +2924,16 @@ ENUM_LOAD_STATUS LoadState()
       if(GlobalVariableCheck(g_gvPrefix + "RC_TRIG")) g_recoveryTriggered = (GlobalVariableGet(g_gvPrefix + "RC_TRIG") > 0.5);
       if(GlobalVariableCheck(g_gvPrefix + "OEAS_DIS"))g_otherEAsDisabled  = (GlobalVariableGet(g_gvPrefix + "OEAS_DIS") > 0.5);
       if(GlobalVariableCheck(g_gvPrefix + "PR_PH"))   g_prPhase           = (ENUM_PR_PHASE)(int)GlobalVariableGet(g_gvPrefix + "PR_PH");
-      if(GlobalVariableCheck(g_gvPrefix + "PR_COA"))  g_prCloseOldActive  = (GlobalVariableGet(g_gvPrefix + "PR_COA") > 0.5);
-      if(GlobalVariableCheck(g_gvPrefix + "PR_COS"))  g_prCloseOldSide    = (GlobalVariableGet(g_gvPrefix + "PR_COS") > 0.5) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
-      // v1.53: seed-lot machinery
-      if(GlobalVariableCheck(g_gvPrefix + "PR_SLA"))  g_prSeedActive      = (GlobalVariableGet(g_gvPrefix + "PR_SLA") > 0.5);
-      if(GlobalVariableCheck(g_gvPrefix + "PR_SLS"))  g_prSeedSide        = (GlobalVariableGet(g_gvPrefix + "PR_SLS") > 0.5) ? POSITION_TYPE_SELL : POSITION_TYPE_BUY;
-      if(GlobalVariableCheck(g_gvPrefix + "PR_SLT"))  g_prSeedLot         = GlobalVariableGet(g_gvPrefix + "PR_SLT");
+      if(GlobalVariableCheck(g_gvPrefix + "RC_DD0"))  g_initialDrawdown   = GlobalVariableGet(g_gvPrefix + "RC_DD0");
+      // v1.60: forward migration — nuke v1.43–1.53 legacy keys even on
+      // same-mode load, so users upgrading from v1.53 don't carry stale
+      // trend-flip / seed-lot state forward.
+      string legacyKeys[] = {"PR_COA","PR_COS","PR_SLA","PR_SLS","PR_SLT"};
+      for(int i = 0; i < ArraySize(legacyKeys); i++)
+        {
+         string k = g_gvPrefix + legacyKeys[i];
+         if(GlobalVariableCheck(k)) GlobalVariableDel(k);
+        }
      }
 
    // Stamp current mode for the next load (always, including LS_CLEAN -> first run).
@@ -3263,16 +2954,12 @@ ENUM_LOAD_STATUS LoadState()
         { ticket = (ulong)StringToInteger(StringSubstr(n, 13)); if(PositionSelectByTicket(ticket)) TslSet(ticket, GlobalVariableGet(n)); }
      }
 
-   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d trig=%d prPhase=%d prCloseOld=%d/%s prSeed=%d/%s/%.2f savedMode=%d curMode=%d",
+   PrintFormat("State loaded: paused=%d eStop=%d peaks(C/B/S)=%.2f/%.2f/%.2f BE=%d TSL=%d lockPhase=%d remSide=%d relocks=%d trig=%d prPhase=%d initDD=%.2f savedMode=%d curMode=%d",
                g_paused, g_emergencyStop, g_peakProfit, g_peakBuyProfit, g_peakSellProfit,
                ArraySize(g_beTickets), ArraySize(g_tslTickets),
                (int)g_lockPhase, (int)g_remainingSide, g_relockCount,
                (int)g_recoveryTriggered, (int)g_prPhase,
-               (int)g_prCloseOldActive,
-               (g_prCloseOldSide == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-               (int)g_prSeedActive,
-               (g_prSeedSide == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-               g_prSeedLot,
+               g_initialDrawdown,
                savedMode, (int)InpMode);
 
    //--- Recompute partial-recovery averager counts from open positions ---
@@ -3315,25 +3002,22 @@ void DoResetState()
    g_prLastBarTime     = 0;
    g_prLastBarTimeS    = 0;
    g_prLastTrend       = 0;
-   g_prCloseOldActive  = false;
-   g_prCloseOldSide    = POSITION_TYPE_BUY;
-   g_prSeedActive      = false;
-   g_prSeedSide        = POSITION_TYPE_BUY;
-   g_prSeedLot         = 0.0;
+   g_initialDrawdown   = 0.0;
    g_recoveryTriggered = false;
    g_otherEAsDisabled  = false;
    g_peakProfit        = 0.0;
    g_peakBuyProfit     = 0.0;
    g_peakSellProfit    = 0.0;
 
-   // GVs -> erase the same set
+   // GVs -> erase the same set (plus v1.43–1.53 legacy keys, in case the
+   // Reset is called on an instance that was upgraded mid-cycle).
    if(g_gvPrefix != "")
      {
       string keys[] = {"LK_PH","LK_RS","LK_PB","LK_PS","LK_RC",
-                       "RC_TRIG","OEAS_DIS","PR_PH",
-                       "PR_COA","PR_COS",
-                       "PR_SLA","PR_SLS","PR_SLT",
-                       "PEAK_C","PEAK_B","PEAK_S"};
+                       "RC_TRIG","OEAS_DIS","PR_PH","RC_DD0",
+                       "PEAK_C","PEAK_B","PEAK_S",
+                       // v1.43–1.53 legacy keys (forward migration nuke)
+                       "PR_COA","PR_COS","PR_SLA","PR_SLS","PR_SLT"};
       for(int i = 0; i < ArraySize(keys); i++)
         {
          string k = g_gvPrefix + keys[i];
